@@ -32,6 +32,18 @@ _SELF_NAME_CUES = (
     "my name is",
 )
 _NON_NAME_TOKENS = ("明白", "小姐", "先生", "女士", "太太", "客户", "客戶", "喂", "你好")
+_INCOMPLETE_NAME_PHRASES = {
+    "你可以叫我",
+    "可以叫我",
+    "叫我",
+    "我叫",
+    "你叫我",
+    "称呼我",
+    "稱呼我",
+    "随便",
+    "隨便",
+    "都可以",
+}
 _NAME_TRAILING_FILLERS = (
     "就可以了",
     "就可以",
@@ -163,6 +175,39 @@ _REPAIR_GENERIC_WORDS = (
     "嘅",
     "我",
     "要",
+)
+_REPAIR_FAULT_MARKERS = (
+    "打不开",
+    "打唔开",
+    "開唔到",
+    "开不了",
+    "開不了",
+    "无法",
+    "無法",
+    "进水",
+    "進水",
+    "入水",
+    "漏水",
+    "跳闸",
+    "跳掣",
+    "异响",
+    "異響",
+    "没反应",
+    "冇反應",
+    "唔冻",
+    "唔凍",
+    "不制冷",
+    "坏",
+    "壞",
+    "故障",
+)
+_REPAIR_TIME_RE = re.compile(
+    r"(?:今天|今日|昨天|尋日|昨晚|琴晚)"
+    r"(?:早上|朝早|上午|中午|下午|晚上|夜晚)?"
+)
+_REPAIR_LEADING_FILLER_RE = re.compile(
+    r"^(?:(?:你好|您好|喂|哎|唉|好的|好嘅|嗯|嗱)[呀啊哦喔]*"
+    r"[\s，。,.!！?？]*)+"
 )
 
 _ADDRESS_MARKERS = (
@@ -482,6 +527,8 @@ def _normalize_name(
         return None
     if candidate in _NON_NAME_TOKENS:
         return None
+    if candidate in _INCOMPLETE_NAME_PHRASES:
+        return None
     if candidate in {"明白小姐", "先生", "小姐"}:
         return None
 
@@ -649,6 +696,41 @@ def _repair_valid(text: str | None) -> bool:
     return bool(detail.strip(" ，。,.!！?？"))
 
 
+def _summarize_repair_text(text: str | None) -> str:
+    original = (text or "").strip(" ，。,.!！?？；; ")
+    if len(original) <= 24:
+        return original
+
+    clauses = re.split(r"[，。；;,.!?！？]+", original)
+    summary_parts: list[str] = []
+    for raw_clause in clauses:
+        clause = raw_clause.strip()
+        if not clause:
+            continue
+        clause = _REPAIR_LEADING_FILLER_RE.sub("", clause)
+        clause = _REPAIR_TIME_RE.sub("", clause)
+        clause = re.sub(r"^(?:我嘅|我的|我)\s*", "", clause)
+        for filler in ("可能是", "可能係", "应该是", "應該係", "突然"):
+            clause = clause.replace(filler, "")
+        clause = clause.replace("打不开了", "打不开").strip()
+        if not clause:
+            continue
+
+        request_only = (
+            any(x in clause for x in ("维修", "維修", "修一下", "整一下"))
+            and not any(x in clause for x in _REPAIR_FAULT_MARKERS)
+        )
+        if request_only and summary_parts:
+            continue
+        if clause not in summary_parts:
+            summary_parts.append(clause)
+
+    summary = "，".join(summary_parts[:2]) or original
+    if len(summary) > 40:
+        summary = summary[:40].rstrip(" ，。,.!！?？；; ")
+    return summary
+
+
 def _apply_expected_field_fallback(
     result: ExtractResult,
     text: str,
@@ -772,6 +854,10 @@ def _finalize_extract(
         result.customer_address = None
     if result.repair_description and not _repair_valid(result.repair_description):
         result.repair_description = None
+    elif result.repair_description:
+        result.repair_description = _summarize_repair_text(
+            result.repair_description
+        )
 
     if "phone" not in result.confidence and result.customer_phone:
         result.confidence["phone"] = 0.85

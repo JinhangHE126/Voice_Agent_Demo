@@ -117,6 +117,30 @@ def test_expected_name_strips_conversational_suffix() -> None:
     assert out.customer_name == "胡先生"
 
 
+def test_expected_name_rejects_incomplete_call_me_phrase() -> None:
+    out = extract_info("你可以叫我", expected_field="customer_name")
+    assert out.customer_name is None
+
+
+def test_incomplete_name_phrase_keeps_asking_for_name() -> None:
+    manager = DialogManager()
+    draft = RepairOrderDraft(
+        customer_phone="51464523",
+        customer_address="香港数码城二楼",
+        repair_description="电脑主机进水",
+        awaiting_field="customer_name",
+    )
+
+    turn = manager.process_user_text(
+        call_id="incomplete-name",
+        draft=draft,
+        user_text="你可以叫我",
+    )
+
+    assert draft.customer_name is None
+    assert turn.plan.prompt_id == "ask_name"
+
+
 def test_expected_repair_rejects_generic_scaffold() -> None:
     out = extract_info("我维修的", expected_field="repair_description")
     assert out.repair_description is None
@@ -125,6 +149,15 @@ def test_expected_repair_rejects_generic_scaffold() -> None:
 def test_expected_repair_accepts_actual_device_detail() -> None:
     out = extract_info("我要维修电脑主机", expected_field="repair_description")
     assert out.repair_description == "我要维修电脑主机"
+
+
+def test_long_repair_description_is_summarized() -> None:
+    out = extract_info(
+        "你好，我今天早上电脑主机突然打不开了，"
+        "可能是昨天晚上进水了，需要来修一下",
+        expected_field="repair_description",
+    )
+    assert out.repair_description == "电脑主机打不开，进水了"
 
 
 def test_extract_intent_and_fields_to_correct() -> None:
