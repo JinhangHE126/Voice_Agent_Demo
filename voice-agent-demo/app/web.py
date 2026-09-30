@@ -54,6 +54,18 @@ async def ws_session(websocket: WebSocket) -> None:
     session = CallSession(emit=emit, settings=settings)
     await session.start()
 
+    async def handle_pcm16(raw: bytes) -> None:
+        try:
+            await session.on_pcm16(raw)
+        except Exception as exc:  # Last-resort isolation for provider failures.
+            await emit(
+                ServerEvent(
+                    type="error",
+                    call_id=session.call_id,
+                    data={"message": f"audio processing failed: {exc}"},
+                )
+            )
+
     try:
         while True:
             message = await websocket.receive()
@@ -61,7 +73,7 @@ async def ws_session(websocket: WebSocket) -> None:
                 break
 
             if "bytes" in message and message["bytes"] is not None:
-                await session.on_pcm16(message["bytes"])
+                await handle_pcm16(message["bytes"])
                 continue
 
             text = message.get("text")
@@ -79,7 +91,7 @@ async def ws_session(websocket: WebSocket) -> None:
 
             if event_type == "audio.pcm16":
                 raw = base64.b64decode(data.get("b64", ""))
-                await session.on_pcm16(raw)
+                await handle_pcm16(raw)
             elif event_type == "utterance.end":
                 await session.force_end_utterance()
             elif event_type == "playback.done":

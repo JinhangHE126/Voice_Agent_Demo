@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -9,14 +10,39 @@ from pathlib import Path
 from openai import AsyncOpenAI, OpenAI
 
 _PHONE_RE = re.compile(r"(?:\+?\d[\d\-\s]{6,}\d)")
+_PHONE_CUE_RE = re.compile(
+    r"(?:联系电话|聯絡電話|电话号码|電話號碼|电话|電話|号码|號碼)"
+    r"(?:係|是|为|為)?\s*[:：]?\s*(.+)$"
+)
 _DIGIT_ONLY_RE = re.compile(r"^[\d\s\-]+$")
 _SELF_NAME_RE = re.compile(
-    r"(?:我叫|我係|我是|姓名(?:係|是)?|my name is)\s*([^\s，。,.!！?？]{1,16})",
+    r"(?:我叫|叫我|称呼我|稱呼我|我係|我是|姓名(?:係|是)?|my name is)\s*"
+    r"([^\s，。,.!！?？]{1,16})",
     re.IGNORECASE,
 )
 _TITLE_NAME_RE = re.compile(r"([^\s，。,.!！?？]{1,12}(?:先生|小姐|太太|女士|生))")
-_SELF_NAME_CUES = ("我叫", "我係", "我是", "姓名", "my name is")
+_SELF_NAME_CUES = (
+    "我叫",
+    "叫我",
+    "称呼我",
+    "稱呼我",
+    "我係",
+    "我是",
+    "姓名",
+    "my name is",
+)
 _NON_NAME_TOKENS = ("明白", "小姐", "先生", "女士", "太太", "客户", "客戶", "喂", "你好")
+_NAME_TRAILING_FILLERS = (
+    "就可以了",
+    "就可以",
+    "就行了",
+    "就得啦",
+    "就得了",
+    "就行",
+    "就得",
+    "可以了",
+    "得啦",
+)
 
 _CN_DIGIT_MAP = {
     "零": "0",
@@ -35,6 +61,20 @@ _CN_DIGIT_MAP = {
     "九": "9",
     "洞": "0",
 }
+
+# Common ASR substitutions seen while callers dictate a phone number. These
+# are only enabled for an expected phone field and a digit-like utterance.
+_PHONE_FUZZY_DIGIT_MAP = {
+    "幺": "1",
+    "么": "1",
+    "拐": "7",
+    "公": "9",
+    "勾": "9",
+    "狗": "9",
+    "够": "9",
+    "夠": "9",
+}
+_PHONE_SPOKEN_SEPARATORS = set(" \t\r\n，。,.!！?？、-—")
 
 _CONFIRM_WORDS = {
     "啱",
@@ -80,7 +120,50 @@ _REPAIR_MARKERS = (
     "满",
     "滿",
 )
-_REPAIR_TOO_VAGUE = {"坏咗", "壞咗", "坏了", "壞咗啊", "唔得", "有问题", "有問題"}
+_NON_REPAIR_PHRASES = (
+    "维修地址",
+    "維修地址",
+    "报修地址",
+    "報修地址",
+    "维修地点",
+    "維修地點",
+)
+_REPAIR_TOO_VAGUE = {
+    "坏咗",
+    "壞咗",
+    "坏了",
+    "壞咗啊",
+    "唔得",
+    "有问题",
+    "有問題",
+    "我维修的",
+    "我維修的",
+    "要维修",
+    "要維修",
+    "维修一下",
+    "維修一下",
+}
+_REPAIR_GENERIC_WORDS = (
+    "有问题",
+    "有問題",
+    "帮我",
+    "幫我",
+    "我想",
+    "需要",
+    "维修",
+    "維修",
+    "修理",
+    "坏咗",
+    "壞咗",
+    "坏了",
+    "壞了",
+    "唔得",
+    "一下",
+    "的",
+    "嘅",
+    "我",
+    "要",
+)
 
 _ADDRESS_MARKERS = (
     "地址",
@@ -183,6 +266,16 @@ def _llm_enabled() -> bool:
     }
 
 
+def _llm_timeout_s() -> float:
+    try:
+        return max(
+            0.5,
+            float(os.getenv("REPAIR_ORDER_EXTRACT_TIMEOUT_S", "3.0")),
+        )
+    except ValueError:
+        return 3.0
+
+
 def _llm_client_or_none() -> OpenAI | None:
     global _llm_client
     if _llm_client is not None:
@@ -195,7 +288,7 @@ def _llm_client_or_none() -> OpenAI | None:
     _llm_client = OpenAI(
         api_key=api_key,
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        timeout=15.0,
+        timeout=_llm_timeout_s(),
     )
     return _llm_client
 
@@ -212,7 +305,7 @@ def _async_llm_client_or_none() -> AsyncOpenAI | None:
     _async_llm_client = AsyncOpenAI(
         api_key=api_key,
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        timeout=15.0,
+        timeout=_llm_timeout_s(),
     )
     return _async_llm_client
 
@@ -266,14 +359,44 @@ async def _llm_extract_async(
     return _extract_json_object(content)
 
 
-def _spoken_digits_to_phone(text: str) -> str:
+def _spoken_digits_to_phone(text: str, *, allow_fuzzy: bool = False) -> str:
     chars: list[str] = []
     for ch in text:
         if ch.isdigit():
             chars.append(ch)
         elif ch in _CN_DIGIT_MAP:
             chars.append(_CN_DIGIT_MAP[ch])
-    return "".join(chars)
+    exact = "".join(chars)
+    if not allow_fuzzy:
+        return exact
+
+    fuzzy_text = text
+    cue_match = _PHONE_CUE_RE.search(text)
+    if cue_match:
+        fuzzy_text = cue_match.group(1)
+
+    # Never fuzzy-map arbitrary prose (for example, "公司电话..."). Accept
+    # only a compact sequence made entirely of digits, known digit words,
+    # separators, and a small set of observed phone-number substitutions.
+    # A recognized phone-field prefix may be safely removed first.
+    fuzzy_chars: list[str] = []
+    used_fuzzy = False
+    for ch in fuzzy_text:
+        if ch in _PHONE_SPOKEN_SEPARATORS:
+            continue
+        if ch.isdigit():
+            fuzzy_chars.append(ch)
+        elif ch in _CN_DIGIT_MAP:
+            fuzzy_chars.append(_CN_DIGIT_MAP[ch])
+        elif ch in _PHONE_FUZZY_DIGIT_MAP:
+            fuzzy_chars.append(_PHONE_FUZZY_DIGIT_MAP[ch])
+            used_fuzzy = True
+        else:
+            return exact
+    fuzzy = "".join(fuzzy_chars)
+    if used_fuzzy and _is_valid_phone_digits(fuzzy):
+        return fuzzy
+    return exact
 
 
 def _is_valid_phone_digits(digits: str) -> bool:
@@ -290,17 +413,21 @@ def _is_valid_phone_digits(digits: str) -> bool:
     return False
 
 
-def _extract_phone_candidate(text: str) -> str | None:
+def _extract_phone_candidate(
+    text: str,
+    *,
+    allow_fuzzy: bool = False,
+) -> str | None:
     match = _PHONE_RE.search(text)
     if match:
         digits = re.sub(r"\D", "", match.group(0))
         return digits or None
-    spoken = _spoken_digits_to_phone(text)
+    spoken = _spoken_digits_to_phone(text, allow_fuzzy=allow_fuzzy)
     return spoken or None
 
 
-def _normalize_phone(text: str) -> str | None:
-    candidate = _extract_phone_candidate(text)
+def _normalize_phone(text: str, *, allow_fuzzy: bool = False) -> str | None:
+    candidate = _extract_phone_candidate(text, allow_fuzzy=allow_fuzzy)
     if candidate and _is_valid_phone_digits(candidate):
         return candidate
     return None
@@ -330,7 +457,10 @@ def _extract_repair(text: str) -> str | None:
     stripped = text.strip(" ，。,.!！?？")
     if not stripped:
         return None
-    if any(marker in stripped for marker in _REPAIR_MARKERS):
+    marker_text = stripped
+    for phrase in _NON_REPAIR_PHRASES:
+        marker_text = marker_text.replace(phrase, "")
+    if any(marker in marker_text for marker in _REPAIR_MARKERS):
         return stripped
     return None
 
@@ -344,6 +474,10 @@ def _normalize_name(
     candidate = (text or "").strip(" ，。,.!！?？")
     if not candidate:
         return None
+    for suffix in _NAME_TRAILING_FILLERS:
+        if candidate.endswith(suffix):
+            candidate = candidate[: -len(suffix)].strip(" ，。,.!！?？")
+            break
     if len(candidate) <= 1 and not full_text.startswith("我姓"):
         return None
     if candidate in _NON_NAME_TOKENS:
@@ -509,7 +643,10 @@ def _repair_valid(text: str | None) -> bool:
         return False
     if len(t) < 3:
         return False
-    return True
+    detail = t
+    for word in _REPAIR_GENERIC_WORDS:
+        detail = detail.replace(word, "")
+    return bool(detail.strip(" ，。,.!！?？"))
 
 
 def _apply_expected_field_fallback(
@@ -529,7 +666,7 @@ def _apply_expected_field_fallback(
                 stripped, text, expected_field="customer_name"
             )
     elif expected_field == "customer_phone" and not result.customer_phone:
-        result.customer_phone = _normalize_phone(stripped)
+        result.customer_phone = _normalize_phone(stripped, allow_fuzzy=True)
     elif expected_field == "customer_address" and not result.customer_address:
         if _address_valid(stripped):
             result.customer_address = stripped
@@ -599,11 +736,18 @@ def _finalize_extract(
     if not result.fields_to_correct and result.is_deny:
         result.fields_to_correct = _heuristic_corrections(normalized)
 
-    candidate_from_text = _extract_phone_candidate(normalized)
+    allow_fuzzy_phone = expected_field == "customer_phone"
+    candidate_from_text = _extract_phone_candidate(
+        normalized,
+        allow_fuzzy=allow_fuzzy_phone,
+    )
     if result.phone_candidate is None:
         result.phone_candidate = candidate_from_text
     if not result.customer_phone:
-        result.customer_phone = _normalize_phone(normalized)
+        result.customer_phone = _normalize_phone(
+            normalized,
+            allow_fuzzy=allow_fuzzy_phone,
+        )
     if result.phone_error is None:
         if result.customer_phone is None:
             result.phone_error = _phone_error_for(result.phone_candidate)
@@ -661,6 +805,35 @@ def _finalize_extract(
     return result
 
 
+def _rules_are_sufficient(
+    result: ExtractResult,
+    expected_field: str | None,
+) -> bool:
+    # Control intents are deterministic and should never wait on a network
+    # model. Denials also carry heuristic fields_to_correct when provided.
+    if result.intent in {"confirm", "deny", "set_language", "use_ani", "transfer"}:
+        return True
+
+    expected_values = {
+        "customer_name": result.customer_name,
+        "customer_phone": result.customer_phone,
+        "customer_address": result.customer_address,
+        "repair_description": result.repair_description,
+    }
+    if expected_field and expected_values.get(expected_field):
+        return True
+
+    # An invalid phone candidate is already actionable: return the targeted
+    # validation prompt immediately instead of asking an LLM to reinterpret it.
+    if (
+        expected_field == "customer_phone"
+        and result.phone_candidate
+        and result.phone_error in {"invalid_length", "invalid_format"}
+    ):
+        return True
+    return False
+
+
 def extract_info(
     text: str,
     *,
@@ -670,6 +843,9 @@ def extract_info(
     result = ExtractResult()
     if not normalized:
         return result
+    rule_result = _finalize_extract(ExtractResult(), normalized, expected_field)
+    if _rules_are_sufficient(rule_result, expected_field):
+        return rule_result
     llm_obj = _llm_extract(normalized, expected_field=expected_field)
     result = _apply_llm_obj(result, llm_obj, normalized, expected_field)
     return _finalize_extract(result, normalized, expected_field)
@@ -684,6 +860,15 @@ async def extract_info_async(
     result = ExtractResult()
     if not normalized:
         return result
-    llm_obj = await _llm_extract_async(normalized, expected_field=expected_field)
+    rule_result = _finalize_extract(ExtractResult(), normalized, expected_field)
+    if _rules_are_sufficient(rule_result, expected_field):
+        return rule_result
+    try:
+        llm_obj = await asyncio.wait_for(
+            _llm_extract_async(normalized, expected_field=expected_field),
+            timeout=_llm_timeout_s(),
+        )
+    except asyncio.TimeoutError:
+        return rule_result
     result = _apply_llm_obj(result, llm_obj, normalized, expected_field)
     return _finalize_extract(result, normalized, expected_field)

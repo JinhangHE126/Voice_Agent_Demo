@@ -97,8 +97,12 @@ class CallSession:
             else None
         )
         self.dialog = DialogManager(repository=self.order_repo)
-        if self.settings.repair_order_use_llm_extractor:
-            os.environ["REPAIR_ORDER_USE_LLM_EXTRACTOR"] = "1"
+        os.environ["REPAIR_ORDER_USE_LLM_EXTRACTOR"] = (
+            "1" if self.settings.repair_order_use_llm_extractor else "0"
+        )
+        os.environ["REPAIR_ORDER_EXTRACT_TIMEOUT_S"] = str(
+            self.settings.repair_order_extract_timeout_s
+        )
         self.prompts = PromptAudioBank(
             self.settings.resolved_prompt_audio_dir(),
             sample_rate=self.settings.sample_rate,
@@ -235,6 +239,7 @@ class CallSession:
 
     async def close(self) -> None:
         self._closed = True
+        self._greeting_uninterruptible = False
         await self._cancel_generation()
         if self._asr:
             await self._asr.close()
@@ -621,7 +626,14 @@ class CallSession:
         except Exception as exc:  # noqa: BLE001
             await self._emit("error", {"message": str(exc)})
         finally:
-            if route == "repair_greeting":
+            # Keep the greeting locked after all audio has been sent: the
+            # browser may still have queued audio left to play. The normal
+            # success path unlocks only when playback.done arrives.
+            if (
+                route == "repair_greeting"
+                and generation_id == self.generation_id
+                and not self._awaiting_playback_done
+            ):
                 self._greeting_uninterruptible = False
             if emit_turn_done and generation_id == self.generation_id:
                 if not self._awaiting_playback_done:
@@ -793,6 +805,7 @@ class CallSession:
                 # with jitter. Ignore premature completion and wait.
                 return
         self._awaiting_playback_done = False
+        self._greeting_uninterruptible = False
         self._finish_listening()
         await self._emit("state", {"state": self.state.value})
 

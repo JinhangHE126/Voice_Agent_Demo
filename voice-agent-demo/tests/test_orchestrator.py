@@ -91,6 +91,46 @@ async def test_mock_session_first_audio_under_1s() -> None:
 
 
 @pytest.mark.asyncio
+async def test_greeting_stays_uninterruptible_until_browser_playback_done() -> None:
+    events: list[ServerEvent] = []
+
+    async def emit(ev: ServerEvent) -> None:
+        events.append(ev)
+
+    settings = Settings(
+        agent_mode="mock",
+        business_mode="repair_order",
+        repair_order_use_llm_extractor=False,
+        playback_done_grace_ms=0,
+    )
+    session = CallSession(emit=emit, settings=settings, call_id="greeting-lock")
+    await session.start()
+
+    for _ in range(100):
+        greeting_done = any(
+            e.type == "turn.done" and e.data.get("route") == "repair_greeting"
+            for e in events
+        )
+        if greeting_done:
+            break
+        await asyncio.sleep(0.02)
+
+    assert greeting_done, f"greeting did not finish streaming; events={[e.type for e in events]}"
+    assert session._greeting_uninterruptible is True
+
+    event_count = len(events)
+    await session.on_pcm16(b"\x00\x20" * 320)
+    assert len(events) == event_count
+    assert session._greeting_uninterruptible is True
+
+    await session.on_playback_done(session.generation_id)
+    assert session._greeting_uninterruptible is False
+    assert session.state.value == "listening"
+
+    await session.close()
+
+
+@pytest.mark.asyncio
 async def test_graded_router_faq_route(tmp_path) -> None:
     path = tmp_path / "faq.json"
     path.write_text(

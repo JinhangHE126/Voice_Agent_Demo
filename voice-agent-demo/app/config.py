@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     business_mode: str = "repair_order"
     repair_order_sqlite_path: Path = ROOT_DIR / "output" / "repair_orders.sqlite"
     repair_order_use_llm_extractor: bool = True
+    repair_order_extract_timeout_s: float = 3.0
     # Local pre-recorded Yue prompts/fillers (mono 16k PCM wav).
     prompt_audio_dir: Path = ROOT_DIR / "audio" / "yue"
     enable_wait_filler: bool = True

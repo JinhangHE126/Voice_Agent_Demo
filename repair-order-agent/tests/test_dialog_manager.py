@@ -107,6 +107,26 @@ def test_extract_name_from_self_intro() -> None:
     assert out.customer_name == "陈先生"
 
 
+def test_expected_name_strips_call_me_prefix() -> None:
+    out = extract_info("叫我何先生", expected_field="customer_name")
+    assert out.customer_name == "何先生"
+
+
+def test_expected_name_strips_conversational_suffix() -> None:
+    out = extract_info("叫我胡先生就行", expected_field="customer_name")
+    assert out.customer_name == "胡先生"
+
+
+def test_expected_repair_rejects_generic_scaffold() -> None:
+    out = extract_info("我维修的", expected_field="repair_description")
+    assert out.repair_description is None
+
+
+def test_expected_repair_accepts_actual_device_detail() -> None:
+    out = extract_info("我要维修电脑主机", expected_field="repair_description")
+    assert out.repair_description == "我要维修电脑主机"
+
+
 def test_extract_intent_and_fields_to_correct() -> None:
     out = extract_info("唔啱，电话要改做 9876 5432")
     assert out.intent == "deny"
@@ -117,6 +137,55 @@ def test_extract_intent_and_fields_to_correct() -> None:
 def test_extract_address_from_phrase() -> None:
     out = extract_info("地址係旺角弥敦道100号")
     assert out.customer_address == "旺角弥敦道100号"
+
+
+def test_repair_address_phrase_does_not_become_repair_content() -> None:
+    out = extract_info(
+        "我的维修地址是香港数码城",
+        expected_field="customer_address",
+    )
+    assert out.customer_address == "香港数码城"
+    assert out.repair_description is None
+
+
+def test_address_turn_does_not_overwrite_existing_repair() -> None:
+    manager = DialogManager()
+    draft = RepairOrderDraft(
+        customer_phone="12345678",
+        repair_description="电脑主机坏了",
+        awaiting_field="customer_address",
+    )
+
+    manager.process_user_text(
+        call_id="address-preserves-repair",
+        draft=draft,
+        user_text="我的维修地址是香港数码城",
+    )
+
+    assert draft.customer_address == "香港数码城"
+    assert draft.repair_description == "电脑主机坏了"
+
+
+def test_expected_phone_recovers_digit_like_asr_substitution() -> None:
+    out = extract_info(
+        "五公二六六二三七",
+        expected_field="customer_phone",
+    )
+    assert out.customer_phone == "59266237"
+
+
+def test_expected_phone_recovers_asr_substitution_after_phone_cue() -> None:
+    out = extract_info(
+        "联系电话是五公二六六二三七",
+        expected_field="customer_phone",
+    )
+    assert out.customer_phone == "59266237"
+
+
+def test_phone_fuzzy_substitution_is_not_applied_to_prose() -> None:
+    out = extract_info("公司电话稍后再讲")
+    assert out.customer_phone is None
+    assert out.phone_candidate is None
 
 
 def test_multi_turn_short_answers_with_expected_field() -> None:
