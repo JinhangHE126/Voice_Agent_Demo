@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Voice Agent Demo</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=Fraunces:opsz,wght@9..144,500;9..144,600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #10151c;
+      --panel: #1a222d;
+      --line: #2d3a4a;
+      --text: #e7eef6;
+      --muted: #8a9aab;
+      --accent: #2f9e8f;
+      --warn: #c4784a;
+      --ok: #4caf82;
+      --err: #c45c5c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "DM Sans", system-ui, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(ellipse 70% 45% at 10% -5%, #1a3d38 0%, transparent 55%),
+        radial-gradient(ellipse 50% 35% at 100% 0%, #243044 0%, transparent 50%),
+        var(--bg);
+    }
+    main { max-width: 760px; margin: 0 auto; padding: 44px 22px 64px; }
+    h1 {
+      font-family: "Fraunces", Georgia, serif;
+      font-weight: 550;
+      font-size: clamp(1.9rem, 4.5vw, 2.5rem);
+      margin: 0 0 8px;
+      letter-spacing: -0.02em;
+    }
+    .sub { color: var(--muted); line-height: 1.5; margin: 0 0 28px; }
+    .panel {
+      background: color-mix(in srgb, var(--panel) 92%, transparent);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 22px;
+      margin-bottom: 16px;
+    }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 16px; }
+    button {
+      font: inherit; border: 0; border-radius: 10px; padding: 11px 18px;
+      cursor: pointer; background: var(--accent); color: #061311; font-weight: 600;
+    }
+    button.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 8px;
+      border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px;
+      font-size: 0.85rem; color: var(--muted);
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+    .dot.on { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
+    .dot.speak { background: var(--accent); }
+    .dot.warn { background: var(--warn); }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+    .metric { border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
+    .metric .label { color: var(--muted); font-size: 0.78rem; margin-bottom: 4px; }
+    .metric .value { font-size: 1.35rem; font-variant-numeric: tabular-nums; }
+    .metric .value.ok { color: var(--ok); }
+    .metric .value.bad { color: var(--err); }
+    .log {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.82rem; line-height: 1.45; max-height: 280px; overflow: auto;
+      white-space: pre-wrap; color: var(--muted);
+    }
+    .transcript { min-height: 72px; line-height: 1.55; }
+    .transcript .user { color: var(--text); margin-bottom: 8px; }
+    .transcript .bot { color: var(--accent); }
+    .hint { color: var(--muted); font-size: 0.88rem; }
+    .draft-card {
+      margin-top: 14px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px 16px;
+      background: color-mix(in srgb, var(--panel) 80%, #0b1016);
+    }
+    .draft-card .draft-title {
+      color: var(--text);
+      font-weight: 600;
+      margin-bottom: 10px;
+    }
+    .draft-card .draft-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 8px;
+    }
+    .draft-card .draft-list li {
+      display: grid;
+      grid-template-columns: 72px 1fr;
+      gap: 10px;
+      line-height: 1.45;
+      font-size: 0.92rem;
+    }
+    .draft-card .draft-list .k {
+      color: var(--muted);
+    }
+    .draft-card .draft-list .v {
+      color: var(--text);
+      word-break: break-word;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Voice Agent</h1>
+    <p class="sub">
+      預設業務：維修訂單多輪收集（姓名 / 電話 / 地址 / 維修內容）。
+      語音鏈路：Qwen ASR → DialogManager → MiniMax TTS。
+      點開始後先聽開場，再說報修；缺資料時 AI 會追問。
+    </p>
+
+    <section class="panel">
+      <div class="row">
+        <button id="btnStart">開始聽筒</button>
+        <button id="btnStop" class="secondary" disabled>停止</button>
+        <span class="pill"><span class="dot" id="statusDot"></span><span id="statusText">idle</span></span>
+        <span class="pill" id="modePill">mode: …</span>
+        <span class="pill" id="routePill">route: —</span>
+      </div>
+      <div class="transcript" id="transcript">
+        <div class="hint">點開始後說話；停頓後會自動回覆。系統會追問缺漏的姓名/電話/維修內容。</div>
+      </div>
+      <div class="draft-card" id="draftBox">
+        <div class="draft-title" id="draftTitle">訂單草稿</div>
+        <ul class="draft-list">
+          <li><span class="k" id="draftNameLabel">姓名</span><span class="v" id="draftName">—</span></li>
+          <li><span class="k" id="draftPhoneLabel">電話</span><span class="v" id="draftPhone">—</span></li>
+          <li><span class="k" id="draftAddressLabel">地址</span><span class="v" id="draftAddress">—</span></li>
+          <li><span class="k" id="draftRepairLabel">維修</span><span class="v" id="draftRepair">—</span></li>
+          <li><span class="k" id="draftStateLabel">狀態</span><span class="v" id="draftState">—</span></li>
+          <li><span class="k" id="draftAwaitingLabel">等待</span><span class="v" id="draftAwaiting">—</span></li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="metrics">
+        <div class="metric">
+          <div class="label">EoU → ASR final</div>
+          <div class="value" id="mAsr">—</div>
+        </div>
+        <div class="metric">
+          <div class="label">EoU → LLM first token</div>
+          <div class="value" id="mLlm">—</div>
+        </div>
+        <div class="metric">
+          <div class="label">EoU → TTS first audio</div>
+          <div class="value" id="mTts">—</div>
+        </div>
+        <div class="metric">
+          <div class="label">目標 ≤ 1000ms</div>
+          <div class="value" id="mOk">—</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="label" style="color:var(--muted);font-size:0.85rem;margin-bottom:8px;">Event log</div>
+      <div class="log" id="log"></div>
+    </section>
+  </main>
+
+  <script>
+    const el = (id) => document.getElementById(id);
+    const logEl = el("log");
+    const transcript = el("transcript");
+
+    let ws = null;
+    let audioCtx = null;
+    let mediaStream = null;
+    let processor = null;
+    let source = null;
+    let nextPlayTime = 0;
+    let wantListen = false;
+    let playbackDoneTimer = null;
+    let playbackGeneration = 0;
+    const playbackSources = new Set();
+    const PLAYBACK_DONE_GRACE_MS = 450;
+
+    function log(msg) {
+      const t = new Date().toLocaleTimeString();
+      logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent;
+    }
+
+    function setState(state) {
+      el("statusText").textContent = state;
+      const dot = el("statusDot");
+      dot.className = "dot";
+      if (state === "listening") dot.classList.add("on");
+      else if (state === "speaking") dot.classList.add("speak");
+      else if (state === "thinking" || state === "endpointing") dot.classList.add("warn");
+    }
+
+    function setMetric(id, ms, goodMax) {
+      const node = el(id);
+      if (ms == null || Number.isNaN(ms)) {
+        node.textContent = "—";
+        node.className = "value";
+        return;
+      }
+      node.textContent = `${Math.round(ms)} ms`;
+      node.className = "value";
+      if (goodMax != null) node.classList.add(ms <= goodMax ? "ok" : "bad");
+    }
+
+    function escapeHtml(s) {
+      return String(s).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+    }
+
+    function ensureAudio() {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      if (audioCtx.state === "suspended") audioCtx.resume();
+      return audioCtx;
+    }
+
+    function notifyPlaybackDoneSoon() {
+      if (playbackDoneTimer) clearTimeout(playbackDoneTimer);
+      if (!audioCtx) return;
+      const waitMs =
+        Math.max(0, (nextPlayTime - audioCtx.currentTime) * 1000) +
+        PLAYBACK_DONE_GRACE_MS;
+      const generation = playbackGeneration;
+      playbackDoneTimer = setTimeout(() => {
+        playbackDoneTimer = null;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: "playback.done",
+            data: { generation_id: generation },
+          }));
+        }
+      }, waitMs);
+    }
+
+    function playPcm16(b64, sampleRate, generationId) {
+      const ctx = ensureAudio();
+      playbackGeneration = generationId || playbackGeneration;
+      const raw = atob(b64);
+      const bytes = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+      const samples = new Int16Array(bytes.buffer);
+      const f32 = new Float32Array(samples.length);
+      for (let i = 0; i < samples.length; i++) f32[i] = samples[i] / 32768;
+      const buf = ctx.createBuffer(1, f32.length, sampleRate || 16000);
+      buf.copyToChannel(f32, 0);
+      const audioNode = ctx.createBufferSource();
+      audioNode.buffer = buf;
+      audioNode.connect(ctx.destination);
+      const now = ctx.currentTime;
+      if (nextPlayTime < now) nextPlayTime = now;
+      playbackSources.add(audioNode);
+      audioNode.onended = () => playbackSources.delete(audioNode);
+      audioNode.start(nextPlayTime);
+      nextPlayTime += buf.duration;
+      notifyPlaybackDoneSoon();
+    }
+
+    function stopPlayback() {
+      if (playbackDoneTimer) {
+        clearTimeout(playbackDoneTimer);
+        playbackDoneTimer = null;
+      }
+      for (const audioNode of playbackSources) {
+        try { audioNode.stop(); } catch (_) {}
+      }
+      playbackSources.clear();
+      nextPlayTime = 0;
+    }
+
+    function downsampleTo16k(float32, inRate) {
+      if (inRate === 16000) return float32;
+      const ratio = inRate / 16000;
+      const outLen = Math.floor(float32.length / ratio);
+      const out = new Float32Array(outLen);
+      for (let i = 0; i < outLen; i++) out[i] = float32[Math.floor(i * ratio)];
+      return out;
+    }
+
+    function floatToPcm16(float32) {
+      const buf = new ArrayBuffer(float32.length * 2);
+      const view = new DataView(buf);
+      for (let i = 0; i < float32.length; i++) {
+        let s = Math.max(-1, Math.min(1, float32[i]));
+        view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      }
+      return new Uint8Array(buf);
+    }
+
+    async function startMic() {
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+        },
+        video: false,
+      });
+      const ctx = ensureAudio();
+      source = ctx.createMediaStreamSource(mediaStream);
+      // 1024 samples is ~21ms at 48kHz. The old 4096-sample buffer
+      // introduced up to ~85–256ms per microphone packet.
+      processor = ctx.createScriptProcessor(1024, 1, 1);
+      processor.onaudioprocess = (e) => {
+        if (!wantListen || !ws || ws.readyState !== WebSocket.OPEN) return;
+        const input = e.inputBuffer.getChannelData(0);
+        const down = downsampleTo16k(input, ctx.sampleRate);
+        const pcm = floatToPcm16(down);
+        ws.send(pcm.buffer);
+      };
+      const mute = ctx.createGain();
+      mute.gain.value = 0;
+      source.connect(processor);
+      processor.connect(mute);
+      mute.connect(ctx.destination);
+    }
+
+    function stopMic() {
+      wantListen = false;
+      try { processor && processor.disconnect(); } catch (_) {}
+      try { source && source.disconnect(); } catch (_) {}
+      processor = null;
+      source = null;
+      if (mediaStream) {
+        mediaStream.getTracks().forEach((t) => t.stop());
+        mediaStream = null;
+      }
+    }
+
+    const DRAFT_I18N = {
+      yue: {
+        title: "訂單草稿",
+        name: "姓名",
+        phone: "電話",
+        address: "地址",
+        repair: "維修",
+        state: "狀態",
+        awaiting: "等待",
+        states: {
+          collecting: "收集中",
+          confirming: "確認中",
+          saving: "保存中",
+          completed: "已完成",
+        },
+        fields: {
+          repair_description: "維修內容",
+          customer_phone: "電話",
+          customer_address: "地址",
+          customer_name: "姓名",
+        },
+      },
+      cmn: {
+        title: "订单草稿",
+        name: "姓名",
+        phone: "电话",
+        address: "地址",
+        repair: "维修",
+        state: "状态",
+        awaiting: "等待",
+        states: {
+          collecting: "收集中",
+          confirming: "确认中",
+          saving: "保存中",
+          completed: "已完成",
+        },
+        fields: {
+          repair_description: "维修内容",
+          customer_phone: "电话",
+          customer_address: "地址",
+          customer_name: "姓名",
+        },
+      },
+      en: {
+        title: "Order draft",
+        name: "Name",
+        phone: "Phone",
+        address: "Address",
+        repair: "Repair",
+        state: "Status",
+        awaiting: "Awaiting",
+        states: {
+          collecting: "collecting",
+          confirming: "confirming",
+          saving: "saving",
+          completed: "completed",
+        },
+        fields: {
+          repair_description: "repair details",
+          customer_phone: "phone",
+          customer_address: "address",
+          customer_name: "name",
+        },
+      },
+    };
+
+    function renderDraft(draft) {
+      if (!draft) return;
+      const lang = String(draft.session_language || "yue").toLowerCase();
+      const t = DRAFT_I18N[lang] || DRAFT_I18N.yue;
+
+      el("draftTitle").textContent = t.title;
+      el("draftNameLabel").textContent = t.name;
+      el("draftPhoneLabel").textContent = t.phone;
+      el("draftAddressLabel").textContent = t.address;
+      el("draftRepairLabel").textContent = t.repair;
+      el("draftStateLabel").textContent = t.state;
+      el("draftAwaitingLabel").textContent = t.awaiting;
+
+      el("draftName").textContent = draft.customer_name || "—";
+      el("draftPhone").textContent = draft.customer_phone || "—";
+      el("draftAddress").textContent = draft.customer_address || "—";
+      el("draftRepair").textContent = draft.repair_description || "—";
+      el("draftState").textContent =
+        t.states[draft.state] || draft.state || "—";
+      el("draftAwaiting").textContent =
+        t.fields[draft.awaiting_field] || draft.awaiting_field || "—";
+    }
+
+    function handleEvent(ev) {
+      const t = ev.type;
+      const d = ev.data || {};
+      if (t === "session.started") {
+        el("modePill").textContent =
+          `mode: ${d.mode} | biz:${d.business_mode || "faq"} | asr:${d.asr} tts:${d.tts}`;
+        setState("listening");
+        log(`session ${ev.call_id} started`);
+      } else if (t === "order.draft") {
+        renderDraft(d);
+        log(`draft awaiting=${d.awaiting_field || "—"} saved=${!!d.saved}`);
+      } else if (t === "state") {
+        setState(d.state || "idle");
+      } else if (t === "asr.partial") {
+        if (d.text) {
+          transcript.innerHTML =
+            `<div class="user">你（識別中）：${escapeHtml(d.text)}</div>` +
+            `<div class="bot">助手：…</div>`;
+        }
+      } else if (t === "asr.final") {
+        if (d.text) {
+          transcript.innerHTML =
+            `<div class="user">你：${escapeHtml(d.text)}</div>` +
+            `<div class="bot">助手：…</div>`;
+        }
+        setMetric("mAsr", d.empty ? null : null);
+      } else if (t === "llm.first_token") {
+        setMetric("mLlm", d.latency_ms, 600);
+        if (d.route) el("routePill").textContent = `route: ${d.route}`;
+      } else if (t === "llm.delta") {
+        const bot = transcript.querySelector(".bot");
+        if (bot) {
+          const cur = bot.textContent.replace(/^助手：/, "");
+          const next = (cur === "…" ? "" : cur) + (d.text || "");
+          bot.textContent = "助手：" + next;
+        }
+      } else if (t === "tts.first_audio") {
+        setMetric("mTts", d.latency_ms, 1000);
+        el("mOk").textContent = d.ok_under_1s ? "OK" : "慢";
+        el("mOk").className = "value " + (d.ok_under_1s ? "ok" : "bad");
+        if (d.route) el("routePill").textContent = `route: ${d.route}`;
+        log(`first audio ${Math.round(d.latency_ms || 0)}ms`);
+      } else if (t === "tts.audio") {
+        playPcm16(d.pcm16_b64, d.sample_rate, ev.generation_id);
+      } else if (t === "tts.cancel" || t === "barge_in") {
+        stopPlayback();
+        ensureAudio();
+        log(t);
+      } else if (t === "turn.done") {
+        const lat = d.latency || {};
+        setMetric("mAsr", lat.asr_final_ms, 400);
+        setMetric("mLlm", lat.llm_first_token_ms, 600);
+        setMetric("mTts", lat.tts_first_audio_ms, 1000);
+        if (d.route) el("routePill").textContent = `route: ${d.route}`;
+        if (d.draft) renderDraft(d.draft);
+        log(`turn done route=${d.route || "—"} prompt=${d.prompt_id || "—"} saved=${!!d.saved}`);
+      } else if (t === "error") {
+        log("error: " + (d.message || ""));
+      } else if (t !== "pong") {
+        log(t);
+      }
+    }
+
+    async function connect() {
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(`${proto}://${location.host}/ws`);
+      ws.binaryType = "arraybuffer";
+      ws.onmessage = (e) => {
+        try { handleEvent(JSON.parse(e.data)); } catch (err) { log("bad event"); }
+      };
+      ws.onclose = () => { log("ws closed"); setState("idle"); };
+      await new Promise((resolve, reject) => {
+        ws.onopen = resolve;
+        ws.onerror = () => reject(new Error("ws error"));
+      });
+    }
+
+    el("btnStart").onclick = async () => {
+      el("btnStart").disabled = true;
+      try {
+        await connect();
+        wantListen = true;
+        await startMic();
+        el("btnStop").disabled = false;
+        setState("listening");
+      } catch (err) {
+        log(String(err));
+        el("btnStart").disabled = false;
+      }
+    };
+
+    el("btnStop").onclick = () => {
+      wantListen = false;
+      stopMic();
+      stopPlayback();
+      if (audioCtx) {
+        try { audioCtx.close(); } catch (_) {}
+        audioCtx = null;
+      }
+      if (ws) {
+        try { ws.send(JSON.stringify({ type: "session.close" })); } catch (_) {}
+        ws.close();
+        ws = null;
+      }
+      el("btnStart").disabled = false;
+      el("btnStop").disabled = true;
+      setState("idle");
+    };
+  </script>
+</body>
+</html>

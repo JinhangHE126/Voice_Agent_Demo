@@ -1,0 +1,30 @@
+[
+  {
+    "id": "hours_sunday",
+    "keywords": ["星期日", "周日", "礼拜天", "星期天", "关门", "几点"],
+    "reply_yue": "星期日我哋夜晚八点关门。",
+    "reply_zh": "星期天我们晚上八点关门。",
+    "reply_en": "We close at 8 PM on Sunday."
+  },
+  {
+    "id": "hours_weekday",
+    "keywords": ["营业时间", "几点开门", "开门", "平日"],
+    "reply_yue": "平日朝早十點开门，夜晚八点关门。",
+    "reply_zh": "平日早上十点开门，晚上八点关门。",
+    "reply_en": "Weekdays we open at 10 AM and close at 8 PM."
+  },
+  {
+    "id": "address",
+    "keywords": ["地址", "在哪", "位置", "边度"],
+    "reply_yue": "我哋喺中环德辅道中一百号。",
+    "reply_zh": "我们在中环德辅道中一百号。",
+    "reply_en": "We are at 100 Des Voeux Road Central."
+  },
+  {
+    "id": "hello",
+    "keywords": ["你好", "您好", "hello", "hi"],
+    "reply_yue": "你好，有咩可以帮到你？",
+    "reply_zh": "你好，有什么可以帮您？",
+    "reply_en": "Hello, how can I help you?"
+  }
+]
