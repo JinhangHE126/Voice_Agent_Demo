@@ -427,6 +427,24 @@
         t.fields[draft.awaiting_field] || draft.awaiting_field || "—";
     }
 
+    function resetDraft() {
+      renderDraft({
+        customer_name: null,
+        customer_phone: null,
+        customer_address: null,
+        repair_description: null,
+        state: null,
+        awaiting_field: null,
+        session_language: "yue",
+      });
+    }
+
+    function resetTranscript() {
+      transcript.innerHTML =
+        `<div class="hint">點開始後說話；停頓後會自動回覆。系統會追問缺漏的姓名/電話/維修內容。</div>`;
+      el("routePill").textContent = "route: —";
+    }
+
     function handleEvent(ev) {
       const t = ev.type;
       const d = ev.data || {};
@@ -534,6 +552,8 @@
       el("btnStart").disabled = false;
       el("btnStop").disabled = true;
       setState("idle");
+      resetDraft();
+      resetTranscript();
     };
   </script>
 </body>

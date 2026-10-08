@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import os
 import sys
 import time
@@ -12,6 +13,7 @@ from pathlib import Path
 from app.config import Settings, get_settings
 from app.models import LatencyMetrics, ServerEvent, SessionState
 from app.services.asr_qwen import MockStreamingASR, QwenRealtimeASR
+from app.services.denoise import DenoiseConfig, InputDenoiser
 from app.services.llm_router import GradedLLMRouter
 from app.services.prompt_audio import PromptAudioBank
 from app.services.text_norm import detect_reply_lang
@@ -28,6 +30,7 @@ from repair_order.repositories.order_repository import OrderRepository  # noqa: 
 from repair_order.services.dialog_manager import DialogManager  # noqa: E402
 
 EmitFn = Callable[[ServerEvent], Awaitable[None]]
+logger = logging.getLogger(__name__)
 
 
 def _b64(pcm: bytes) -> str:
@@ -67,6 +70,13 @@ class CallSession:
             window_ms=self.settings.vad_window_ms,
             window_min_voiced_ratio=self.settings.vad_window_min_voiced_ratio,
         )
+        self.denoiser = InputDenoiser(
+            DenoiseConfig(
+                enabled=self.settings.input_denoise_enabled,
+                mode=self.settings.input_denoise_mode,
+                sample_rate=self.settings.sample_rate,
+            )
+        )
 
         self.history: list[dict[str, str]] = []
         self._asr = None
@@ -86,6 +96,10 @@ class CallSession:
         self._barge_started_at: float | None = None
         self._last_tts_audio_at: float | None = None
         self._greeting_uninterruptible = False
+        self._speech_started_at: float | None = None
+        self._asr_last_partial_at: float | None = None
+        self._asr_watchdog_task: asyncio.Task | None = None
+        self._asr_watchdog_tripped = False
 
         self.business_mode = (
             self.settings.business_mode.strip().lower() or "repair_order"
@@ -180,6 +194,10 @@ class CallSession:
                 "vad_max_speech_ms": self.settings.vad_max_speech_ms,
                 "vad_window_ms": self.settings.vad_window_ms,
                 "vad_window_min_voiced_ratio": self.settings.vad_window_min_voiced_ratio,
+                "input_denoise": {
+                    "enabled": self.settings.input_denoise_enabled,
+                    "mode": self.settings.input_denoise_mode,
+                },
                 "barge_in_min_ms": self.settings.barge_in_min_ms,
                 "barge_in_thinking_min_ms": self.settings.barge_in_thinking_min_ms,
                 "barge_in_energy_ratio": self.settings.barge_in_energy_ratio,
@@ -240,14 +258,71 @@ class CallSession:
     async def close(self) -> None:
         self._closed = True
         self._greeting_uninterruptible = False
+        self._cancel_asr_watchdog()
         await self._cancel_generation()
         if self._asr:
             await self._asr.close()
+
+    def _cancel_asr_watchdog(self) -> None:
+        if self._asr_watchdog_task and not self._asr_watchdog_task.done():
+            self._asr_watchdog_task.cancel()
+        self._asr_watchdog_task = None
+
+    async def _start_asr_watchdog(self, *, generation_id: int) -> None:
+        self._cancel_asr_watchdog()
+        timeout_ms = max(0, int(self.settings.asr_no_progress_timeout_ms))
+        if timeout_ms <= 0:
+            return
+        started_at = self._speech_started_at
+        if started_at is None:
+            return
+        self._asr_watchdog_task = asyncio.create_task(
+            self._run_asr_watchdog(
+                started_at=started_at,
+                generation_id=generation_id,
+                timeout_ms=timeout_ms,
+            )
+        )
+
+    async def _run_asr_watchdog(
+        self,
+        *,
+        started_at: float,
+        generation_id: int,
+        timeout_ms: int,
+    ) -> None:
+        try:
+            while (
+                not self._closed
+                and generation_id == self.generation_id
+                and self.state == SessionState.LISTENING
+                and self._speech_started_at == started_at
+                and not self._asr_watchdog_tripped
+            ):
+                await asyncio.sleep(0.2)
+                progress_at = self._asr_last_partial_at or started_at
+                idle_ms = (time.perf_counter() - progress_at) * 1000.0
+                if idle_ms < timeout_ms:
+                    continue
+                self._asr_watchdog_tripped = True
+                logger.warning(
+                    "ASR watchdog tripped call=%s idle_ms=%.1f timeout_ms=%d",
+                    self.call_id,
+                    idle_ms,
+                    timeout_ms,
+                )
+                await self.force_end_utterance()
+                break
+        except asyncio.CancelledError:
+            pass
 
     async def on_pcm16(self, pcm: bytes) -> None:
         if self._closed or not pcm:
             return
         if self._greeting_uninterruptible:
+            return
+        pcm = self.denoiser.process(pcm)
+        if not pcm:
             return
 
         if self.state in {SessionState.THINKING, SessionState.SPEAKING}:
@@ -285,6 +360,14 @@ class CallSession:
                     and speaking_for >= min_ms
                     and energy_ok
                 ):
+                    logger.info(
+                        "barge-in accepted call=%s candidate_ms=%.1f speaking_for=%.1f energy=%.1f threshold=%.1f",
+                        self.call_id,
+                        candidate_ms,
+                        speaking_for,
+                        energy,
+                        threshold,
+                    )
                     buffered = bytes(self._barge_buffer)
                     await self._handle_barge_in()
                     if self._asr and buffered:
@@ -299,11 +382,32 @@ class CallSession:
 
         ev = self.vad.accept(pcm)
         if ev["event"] == "speech_start":
+            now = time.perf_counter()
+            self._speech_started_at = now
+            self._asr_last_partial_at = None
+            self._asr_watchdog_tripped = False
+            await self._start_asr_watchdog(generation_id=self.generation_id)
+            logger.info(
+                "speech_start call=%s energy=%.1f threshold=%.1f",
+                self.call_id,
+                float(ev.get("energy") or 0.0),
+                float(ev.get("threshold") or 0.0),
+            )
             await self._emit(
                 "speech.started",
-                {"energy": round(float(ev.get("energy") or 0), 1)},
+                {
+                    "energy": round(float(ev.get("energy") or 0), 1),
+                    "threshold": round(float(ev.get("threshold") or 0), 1),
+                },
             )
         elif ev["event"] == "speech_end":
+            logger.info(
+                "speech_end call=%s reason=%s speech_ms=%s voiced_ratio=%s",
+                self.call_id,
+                ev.get("reason"),
+                ev.get("speech_ms"),
+                ev.get("voiced_ratio"),
+            )
             if self._turn_clock is None:
                 self._turn_clock = time.perf_counter()
                 self._latency = LatencyMetrics(eou_ms=0.0)
@@ -338,6 +442,7 @@ class CallSession:
 
         async def on_partial(text: str) -> None:
             self._partial_text = text
+            self._asr_last_partial_at = time.perf_counter()
             await self._emit("asr.partial", {"text": text})
 
         async def on_final(text: str, lang: str = "yue") -> None:
@@ -365,9 +470,14 @@ class CallSession:
 
     async def _on_asr_final(self, text: str, *, lang: str = "yue") -> None:
         text = (text or "").strip()
+        self._cancel_asr_watchdog()
+        self._speech_started_at = None
+        self._asr_last_partial_at = None
+        self._asr_watchdog_tripped = False
         if self._handling_final:
             return
         if not text:
+            logger.info("asr_final empty call=%s lang=%s", self.call_id, lang)
             self.state = SessionState.LISTENING
             await self._emit("asr.final", {"text": "", "empty": True})
             await self._emit("state", {"state": self.state.value})
@@ -388,6 +498,13 @@ class CallSession:
             )
             self._asr_lang = lang or self._asr_lang
             self._reply_lang = detect_reply_lang(text, self._asr_lang)
+            logger.info(
+                "asr_final call=%s lang=%s text_len=%d asr_final_ms=%s",
+                self.call_id,
+                self._asr_lang,
+                len(text),
+                self._latency.asr_final_ms,
+            )
             self._first_audio_marked = False
             self._awaiting_playback_done = False
             self._barge_buffer.clear()
@@ -696,6 +813,13 @@ class CallSession:
                     "saved": turn.saved,
                 },
             )
+            logger.info(
+                "draft_update call=%s updated_fields=%s awaiting=%s state=%s",
+                self.call_id,
+                turn.updated_fields or [],
+                self.draft.awaiting_field,
+                self.draft.state.value,
+            )
             await self._speak_text(
                 turn.plan.text,
                 generation_id=generation_id,
@@ -814,6 +938,10 @@ class CallSession:
         self.vad.reset()
         self._barge_buffer.clear()
         self._barge_started_at = None
+        self._speech_started_at = None
+        self._asr_last_partial_at = None
+        self._asr_watchdog_tripped = False
+        self._cancel_asr_watchdog()
         self._turn_clock = None
         self._speaking_started_at = None
 

@@ -131,6 +131,57 @@ async def test_greeting_stays_uninterruptible_until_browser_playback_done() -> N
 
 
 @pytest.mark.asyncio
+async def test_asr_watchdog_forces_end_when_no_partial_progress() -> None:
+    events: list[ServerEvent] = []
+
+    async def emit(ev: ServerEvent) -> None:
+        events.append(ev)
+
+    settings = Settings(
+        agent_mode="mock",
+        business_mode="faq",
+        asr_no_progress_timeout_ms=120,
+        vad_webrtc_mode=None,
+    )
+    session = CallSession(emit=emit, settings=settings, call_id="watchdog")
+    await session.start()
+
+    class FakeASR:
+        def __init__(self) -> None:
+            self.end_called = asyncio.Event()
+
+        async def push_pcm16(self, pcm: bytes) -> None:
+            return
+
+        async def end_utterance(self) -> None:
+            self.end_called.set()
+
+        async def close(self) -> None:
+            return
+
+    fake_asr = FakeASR()
+    session._asr = fake_asr
+
+    seen = {"start": False}
+
+    def fake_accept(_pcm: bytes) -> dict:
+        if not seen["start"]:
+            seen["start"] = True
+            return {"event": "speech_start", "energy": 320.0, "threshold": 200.0}
+        return {"event": "none", "energy": 0.0, "threshold": 200.0}
+
+    session.vad.accept = fake_accept  # type: ignore[assignment]
+
+    await session.on_pcm16(b"\x00\x20" * 320)
+    await asyncio.wait_for(fake_asr.end_called.wait(), timeout=1.0)
+
+    assert any(e.type == "speech.ended" and e.data.get("manual") for e in events)
+    assert session.state.value == "endpointing"
+
+    await session.close()
+
+
+@pytest.mark.asyncio
 async def test_graded_router_faq_route(tmp_path) -> None:
     path = tmp_path / "faq.json"
     path.write_text(
