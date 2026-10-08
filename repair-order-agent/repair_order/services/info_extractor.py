@@ -341,18 +341,22 @@ _ADDRESS_TOO_VAGUE = {"屋企", "家里", "家裡", "这里", "這裡", "那边"
 
 _LLM_EXTRACTOR_PROMPT = (
     "你是电话维修工单的结构化抽取器。只输出一个JSON对象，不要解释。\n"
-    "字段要求：name, phone, address, repair, intent, fields_to_correct, lang, confidence, evidence。\n"
-    "name/phone/address/repair 无法确定时必须是 null。\n"
-    "不得把寒暄、语气词、请求脚手架当作字段；name只保留姓名/称呼，"
-    "去掉“就好了/就行”等尾巴；repair必须包含设备或实际故障信息。\n"
-    "每个非空字段必须能在用户原文中找到对应 evidence，禁止猜测或补写。\n"
-    "intent 只能是 provide_info|confirm|deny|use_ani|transfer|other。\n"
-    "fields_to_correct 只允许 customer_name/customer_phone/customer_address/repair_description。\n"
-    "confidence 为0到1的小数；evidence给出原文证据片段。"
+    "只抽取两个字段：repair_description 与 customer_address。\n"
+    "输出JSON示例："
+    '{"repair_description":"电脑主机进水，耳机无声","repair_evidence":["进了点水","耳机没有声音"],'
+    '"customer_address":null,"address_evidence":null,"confidence":{"repair":0.9,"address":0.0}}。\n'
+    "规则：\n"
+    "1. 无法确定时该字段必须是 null，对应 evidence 也是 null。\n"
+    "2. 禁止猜测、补写、改写地址中的数字/楼层/房号。\n"
+    "3. repair_description 只保留设备与真实故障，去掉寒暄与“帮我修一下”等脚手架。\n"
+    "4. customer_address 只保留地址本身，去掉“地址是/住址在”等前缀。\n"
+    "5. evidence 必须是用户原文中的连续片段；非空字段必须至少有一条 evidence。\n"
+    "6. 不要输出姓名、电话、intent、确认/否认等其他字段。"
 )
 
 _llm_client: OpenAI | None = None
 _async_llm_client: AsyncOpenAI | None = None
+_LLM_FIELDS = frozenset({"repair_description", "customer_address"})
 
 
 @dataclass
@@ -403,12 +407,51 @@ def _extract_json_object(text: str) -> dict | None:
         return None
 
 
+def _fallback_env_path() -> Path:
+    return Path(__file__).resolve().parents[3] / "voice-agent-demo" / ".env"
+
+
+def _extract_provider() -> str:
+    return os.getenv("REPAIR_ORDER_EXTRACT_PROVIDER", "deepseek").strip().lower() or "deepseek"
+
+
+def _extract_base_url() -> str:
+    configured = os.getenv("REPAIR_ORDER_EXTRACT_BASE_URL", "").strip()
+    if configured:
+        return configured
+    if _extract_provider() == "dashscope":
+        return "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    return "https://api.deepseek.com"
+
+
+def _extract_model() -> str:
+    configured = os.getenv("REPAIR_ORDER_EXTRACT_MODEL", "").strip()
+    if configured:
+        return configured
+    if _extract_provider() == "dashscope":
+        return "qwen-plus"
+    return "deepseek-flash"
+
+
 def _resolved_api_key() -> str:
-    api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
-    if api_key:
-        return api_key
-    fallback_env = Path(__file__).resolve().parents[3] / "voice-agent-demo" / ".env"
-    return _read_env_value(fallback_env, "DASHSCOPE_API_KEY")
+    for key in (
+        "REPAIR_ORDER_EXTRACT_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "DASHSCOPE_API_KEY",
+    ):
+        api_key = os.getenv(key, "").strip()
+        if api_key:
+            return api_key
+    fallback_env = _fallback_env_path()
+    for key in (
+        "REPAIR_ORDER_EXTRACT_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "DASHSCOPE_API_KEY",
+    ):
+        api_key = _read_env_value(fallback_env, key)
+        if api_key:
+            return api_key
+    return ""
 
 
 def _llm_enabled() -> bool:
@@ -429,6 +472,13 @@ def _llm_timeout_s() -> float:
         return 3.0
 
 
+def reset_llm_clients() -> None:
+    """Test helper: drop cached OpenAI clients after env changes."""
+    global _llm_client, _async_llm_client
+    _llm_client = None
+    _async_llm_client = None
+
+
 def _llm_client_or_none() -> OpenAI | None:
     global _llm_client
     if _llm_client is not None:
@@ -440,7 +490,7 @@ def _llm_client_or_none() -> OpenAI | None:
         return None
     _llm_client = OpenAI(
         api_key=api_key,
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        base_url=_extract_base_url(),
         timeout=_llm_timeout_s(),
     )
     return _llm_client
@@ -457,23 +507,48 @@ def _async_llm_client_or_none() -> AsyncOpenAI | None:
         return None
     _async_llm_client = AsyncOpenAI(
         api_key=api_key,
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        base_url=_extract_base_url(),
         timeout=_llm_timeout_s(),
     )
     return _async_llm_client
 
 
+def _redact_for_llm(text: str) -> str:
+    """Hide phone-like spans before sending text to the extract LLM."""
+    return _PHONE_RE.sub("<PHONE>", text or "")
+
+
 def _llm_messages(text: str, expected_field: str | None) -> list[dict[str, str]]:
     hint = ""
-    if expected_field:
+    if expected_field in _LLM_FIELDS:
         hint = (
             f"\n当前系统正在等待字段: {expected_field}。"
-            "若用户只回答该字段，请优先填写它。"
+            "若用户只回答该字段，请优先填写它；另一字段保持 null。"
+        )
+    elif expected_field:
+        hint = (
+            f"\n当前系统正在等待字段: {expected_field}。"
+            "该字段由规则处理；你仍只输出 repair_description / customer_address，"
+            "若原文没有则保持 null。"
         )
     return [
         {"role": "system", "content": _LLM_EXTRACTOR_PROMPT + hint},
-        {"role": "user", "content": text},
+        {"role": "user", "content": _redact_for_llm(text)},
     ]
+
+
+def _llm_create_kwargs(text: str, expected_field: str | None) -> dict:
+    kwargs: dict = {
+        "model": _extract_model(),
+        "messages": _llm_messages(text, expected_field),
+        "temperature": 0,
+        "max_tokens": 280,
+        "response_format": {"type": "json_object"},
+    }
+    if _extract_provider() != "dashscope":
+        # DeepSeek thinking adds latency; extraction does not need it.
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    return kwargs
 
 
 def _llm_extract(text: str, *, expected_field: str | None = None) -> dict | None:
@@ -482,10 +557,7 @@ def _llm_extract(text: str, *, expected_field: str | None = None) -> dict | None
         return None
     try:
         resp = client.chat.completions.create(
-            model=os.getenv("REPAIR_ORDER_EXTRACT_MODEL", "qwen-plus"),
-            messages=_llm_messages(text, expected_field),
-            temperature=0,
-            max_tokens=280,
+            **_llm_create_kwargs(text, expected_field)
         )
     except Exception:
         return None
@@ -501,10 +573,7 @@ async def _llm_extract_async(
         return None
     try:
         resp = await client.chat.completions.create(
-            model=os.getenv("REPAIR_ORDER_EXTRACT_MODEL", "qwen-plus"),
-            messages=_llm_messages(text, expected_field),
-            temperature=0,
-            max_tokens=280,
+            **_llm_create_kwargs(text, expected_field)
         )
     except Exception:
         return None
@@ -959,47 +1028,69 @@ def _apply_expected_field_fallback(
     return result
 
 
+def _evidence_snippets(raw: object) -> list[str]:
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    if isinstance(raw, str) and raw.strip():
+        return [raw.strip()]
+    return []
+
+
+def _grounded_in_source(value: str, evidence: object, source: str) -> bool:
+    """Reject LLM values that cannot be traced back to the user utterance."""
+    if not value or not source:
+        return False
+    if value in source:
+        return True
+    return any(snippet in source for snippet in _evidence_snippets(evidence))
+
+
 def _apply_llm_obj(
     result: ExtractResult,
     llm_obj: dict | None,
     normalized: str,
     expected_field: str | None,
 ) -> ExtractResult:
+    """Apply LLM output for repair/address only. Name/phone/intent stay rule-owned."""
+    del expected_field  # reserved for future field-specific post-filters
     if not llm_obj:
         return result
-    # allow both new and old schemas
-    name = llm_obj.get("name", llm_obj.get("customer_name"))
-    phone = llm_obj.get("phone", llm_obj.get("customer_phone"))
-    address = llm_obj.get("address", llm_obj.get("customer_address"))
-    repair = llm_obj.get("repair", llm_obj.get("repair_description"))
-    result.customer_name = (
-        _normalize_name(str(name), normalized, expected_field=expected_field)
-        if name
-        else None
+
+    address = llm_obj.get("customer_address", llm_obj.get("address"))
+    repair = llm_obj.get("repair_description", llm_obj.get("repair"))
+    address_evidence = llm_obj.get(
+        "address_evidence",
+        (llm_obj.get("evidence") or {}).get("address")
+        if isinstance(llm_obj.get("evidence"), dict)
+        else None,
     )
-    result.customer_phone = _normalize_phone(str(phone)) if phone else None
-    if phone:
-        result.phone_candidate = _extract_phone_candidate(str(phone))
-        result.phone_error = _phone_error_for(result.phone_candidate)
+    repair_evidence = llm_obj.get(
+        "repair_evidence",
+        (llm_obj.get("evidence") or {}).get("repair")
+        if isinstance(llm_obj.get("evidence"), dict)
+        else None,
+    )
+
     if address:
         candidate = str(address).strip()
-        result.customer_address = candidate if _address_valid(candidate) else None
-    if repair:
-        result.repair_description = str(repair).strip()
+        if _address_valid(candidate) and _grounded_in_source(
+            candidate, address_evidence, normalized
+        ):
+            result.customer_address = candidate
+            snippets = _evidence_snippets(address_evidence)
+            result.evidence["address"] = snippets[0] if snippets else candidate
 
-    intent = llm_obj.get("intent")
-    if isinstance(intent, str) and intent.strip():
-        result.intent = intent.strip()
-    fields = llm_obj.get("fields_to_correct")
-    if isinstance(fields, list):
-        result.fields_to_correct = [str(x) for x in fields if str(x).strip()]
-    lang = llm_obj.get("lang")
-    if isinstance(lang, str) and lang.strip():
-        result.lang = lang.strip()
-    result.confidence = _normalize_conf(llm_obj.get("confidence"))
-    result.evidence = _normalize_evidence(llm_obj.get("evidence"))
-    if "lang" in result.confidence:
-        result.lang_confidence = float(result.confidence["lang"])
+    if repair:
+        candidate = str(repair).strip()
+        if candidate and _grounded_in_source(candidate, repair_evidence, normalized):
+            result.repair_description = candidate
+            snippets = _evidence_snippets(repair_evidence)
+            result.evidence["repair"] = snippets[0] if snippets else candidate
+
+    conf = _normalize_conf(llm_obj.get("confidence"))
+    for key in ("repair", "address"):
+        if key in conf:
+            result.confidence[key] = conf[key]
     return result
 
 
@@ -1101,13 +1192,8 @@ def _rules_are_sufficient(
     if result.intent in {"confirm", "deny", "set_language", "use_ani", "transfer"}:
         return True
 
-    expected_values = {
-        "customer_name": result.customer_name,
-        "customer_phone": result.customer_phone,
-        "customer_address": result.customer_address,
-        "repair_description": result.repair_description,
-    }
-    if expected_field and expected_values.get(expected_field):
+    # Name/phone are rule-owned. Never call the extract LLM for them.
+    if expected_field in {"customer_name", "customer_phone"}:
         return True
 
     # An invalid phone candidate is already actionable: return the targeted
@@ -1117,6 +1203,12 @@ def _rules_are_sufficient(
         and result.phone_candidate
         and result.phone_error in {"invalid_length", "invalid_format"}
     ):
+        return True
+
+    # repair / address (or free-form turns that may contain them): prefer LLM.
+    if expected_field in _LLM_FIELDS:
+        return False
+    if result.repair_description and result.customer_address:
         return True
     return False
 

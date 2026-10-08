@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     repair_order_sqlite_path: Path = ROOT_DIR / "output" / "repair_orders.sqlite"
     repair_order_use_llm_extractor: bool = True
     repair_order_extract_timeout_s: float = 3.0
+    # deepseek | dashscope — structured extract for repair/address only
+    repair_order_extract_provider: str = "deepseek"
+    repair_order_extract_base_url: str = "https://api.deepseek.com"
+    repair_order_extract_api_key: str = ""
+    repair_order_extract_model: str = "deepseek-flash"
+    deepseek_api_key: str = ""
     # Local pre-recorded Yue prompts/fillers (mono 16k PCM wav).
     prompt_audio_dir: Path = ROOT_DIR / "audio" / "yue"
     enable_wait_filler: bool = True
@@ -110,6 +116,18 @@ class Settings(BaseSettings):
 
     def resolved_fast_llm_key(self) -> str:
         return self.fast_llm_api_key.strip() or self.dashscope_api_key.strip()
+
+    def resolved_extract_api_key(self) -> str:
+        provider = self.repair_order_extract_provider.strip().lower()
+        if provider == "dashscope":
+            return (
+                self.repair_order_extract_api_key.strip()
+                or self.dashscope_api_key.strip()
+            )
+        return (
+            self.repair_order_extract_api_key.strip()
+            or self.deepseek_api_key.strip()
+        )
 
     def resolved_prompt_audio_dir(self) -> Path:
         path = self.prompt_audio_dir
