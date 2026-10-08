@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     dashscope_asr_ws_url: str = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
     dashscope_asr_silence_ms: int = 300
     dashscope_asr_final_timeout_ms: int = 2500
-    asr_no_progress_timeout_ms: int = 3000
+    asr_no_progress_timeout_ms: int = 0
 
     minimax_api_key: str = ""
     minimax_tts_model: str = "speech-2.8-turbo"
@@ -79,7 +79,7 @@ class Settings(BaseSettings):
     vad_noise_multiplier: float = 2.5 # 用EMA来学习环境底噪。调大：底噪更抗噪声， 轻声更难进来。 调小：底噪更灵敏， 轻声更容易进来。
     vad_max_speech_ms: int = 12000 #一轮说话最长 12 秒，到了就强制 speech_end
     vad_window_ms: int = 1200 # 看最近1.2秒里， 有多少帧被判断为有声音。窗口越大：判断更稳，但反应更慢。
-    vad_window_min_voiced_ratio: float = 0.35 # 最近 1.2 秒里，有声帧占比如果低于 35%，提前结束本轮。
+    vad_window_min_voiced_ratio: float = 0.20 # 最近 1.2 秒里，有声帧占比如果低于 35%，提前结束本轮。
     min_speech_ms: int = 200 # 连续被判定为{有声音}的最小时间。
     barge_in_min_ms: int = 250
     barge_in_thinking_min_ms: int = 500
