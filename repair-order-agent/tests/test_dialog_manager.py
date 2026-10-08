@@ -202,6 +202,19 @@ def test_extract_intent_and_fields_to_correct() -> None:
 def test_extract_address_from_phrase() -> None:
     out = extract_info("地址係旺角弥敦道100号")
     assert out.customer_address == "旺角弥敦道100号"
+    assert out.is_confirm is False
+    assert out.intent == "provide_info"
+
+
+def test_copula_in_information_is_not_confirmation() -> None:
+    assert extract_info("电话係91234567").is_confirm is False
+    assert extract_info("问题係冷气唔冻").is_confirm is False
+
+
+def test_short_cantonese_confirmation_still_works() -> None:
+    assert extract_info("係").is_confirm is True
+    assert extract_info("嗯，係啊").is_confirm is True
+    assert extract_info("啱").is_confirm is True
 
 
 def test_expected_address_rejects_greeting_only() -> None:

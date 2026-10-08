@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from openai import AsyncOpenAI, OpenAI
+
+logger = logging.getLogger(__name__)
 
 _PHONE_RE = re.compile(r"(?:\+?\d[\d\-\s]{6,}\d)")
 _PHONE_CUE_RE = re.compile(
@@ -102,10 +106,22 @@ _PHONE_FUZZY_DIGIT_MAP = {
 }
 _PHONE_SPOKEN_SEPARATORS = set(" \t\r\n，。,.!！?？、-—")
 
-_CONFIRM_WORDS = {
+_CONFIRM_FULL_UTTERANCES = {
     "啱",
+    "啱啊",
+    "啱呀",
+    "啱啦",
     "係",
+    "係啊",
+    "係呀",
+    "係啦",
+    "係喇",
     "是",
+    "是的",
+    "对",
+    "對",
+    "对的",
+    "對的",
     "正确",
     "正確",
     "没错",
@@ -114,8 +130,10 @@ _CONFIRM_WORDS = {
     "yes",
     "ok",
     "okay",
-    "对",
-    "對",
+    "冇问题",
+    "冇問題",
+    "没有问题",
+    "沒有問題",
 }
 _DENY_WORDS = {
     "唔啱",
@@ -554,15 +572,41 @@ def _llm_create_kwargs(text: str, expected_field: str | None) -> dict:
 def _llm_extract(text: str, *, expected_field: str | None = None) -> dict | None:
     client = _llm_client_or_none()
     if client is None:
+        logger.warning(
+            "extract_llm skipped provider=%s model=%s reason=disabled_or_missing_key",
+            _extract_provider(),
+            _extract_model(),
+        )
         return None
+    started = time.perf_counter()
     try:
         resp = client.chat.completions.create(
             **_llm_create_kwargs(text, expected_field)
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "extract_llm failed provider=%s model=%s expected=%s elapsed_ms=%.1f error=%s",
+            _extract_provider(),
+            _extract_model(),
+            expected_field,
+            (time.perf_counter() - started) * 1000.0,
+            type(exc).__name__,
+        )
         return None
     content = (resp.choices[0].message.content or "").strip()
-    return _extract_json_object(content)
+    obj = _extract_json_object(content)
+    logger.info(
+        "extract_llm completed provider=%s model=%s expected=%s elapsed_ms=%.1f "
+        "valid_json=%s repair=%s address=%s",
+        _extract_provider(),
+        _extract_model(),
+        expected_field,
+        (time.perf_counter() - started) * 1000.0,
+        obj is not None,
+        bool(obj and obj.get("repair_description")),
+        bool(obj and obj.get("customer_address")),
+    )
+    return obj
 
 
 async def _llm_extract_async(
@@ -570,15 +614,50 @@ async def _llm_extract_async(
 ) -> dict | None:
     client = _async_llm_client_or_none()
     if client is None:
+        logger.warning(
+            "extract_llm skipped provider=%s model=%s reason=disabled_or_missing_key",
+            _extract_provider(),
+            _extract_model(),
+        )
         return None
+    started = time.perf_counter()
     try:
         resp = await client.chat.completions.create(
             **_llm_create_kwargs(text, expected_field)
         )
-    except Exception:
+    except asyncio.CancelledError:
+        logger.warning(
+            "extract_llm cancelled provider=%s model=%s expected=%s elapsed_ms=%.1f",
+            _extract_provider(),
+            _extract_model(),
+            expected_field,
+            (time.perf_counter() - started) * 1000.0,
+        )
+        raise
+    except Exception as exc:
+        logger.warning(
+            "extract_llm failed provider=%s model=%s expected=%s elapsed_ms=%.1f error=%s",
+            _extract_provider(),
+            _extract_model(),
+            expected_field,
+            (time.perf_counter() - started) * 1000.0,
+            type(exc).__name__,
+        )
         return None
     content = (resp.choices[0].message.content or "").strip()
-    return _extract_json_object(content)
+    obj = _extract_json_object(content)
+    logger.info(
+        "extract_llm completed provider=%s model=%s expected=%s elapsed_ms=%.1f "
+        "valid_json=%s repair=%s address=%s",
+        _extract_provider(),
+        _extract_model(),
+        expected_field,
+        (time.perf_counter() - started) * 1000.0,
+        obj is not None,
+        bool(obj and obj.get("repair_description")),
+        bool(obj and obj.get("customer_address")),
+    )
+    return obj
 
 
 def _spoken_digits_to_phone(text: str, *, allow_fuzzy: bool = False) -> str:
@@ -866,6 +945,18 @@ def _detect_intent(text: str, is_confirm: bool, is_deny: bool) -> str:
     return "other"
 
 
+def _is_confirm_utterance(text: str) -> bool:
+    """Accept confirmation replies, but never treat copulas inside facts as yes."""
+    compact = re.sub(r"[\s，。,.!！?？、]+", "", text.lower())
+    if compact in _CONFIRM_FULL_UTTERANCES:
+        return True
+    # Natural acknowledgements such as “嗯，係啊” and “好，啱”.
+    for prefix in ("嗯嗯", "嗯", "好的", "好"):
+        if compact.startswith(prefix) and compact[len(prefix) :] in _CONFIRM_FULL_UTTERANCES:
+            return True
+    return False
+
+
 def _normalize_conf(conf: object) -> dict[str, float]:
     if not isinstance(conf, dict):
         return {}
@@ -1102,9 +1193,7 @@ def _finalize_extract(
     lowered = normalized.lower()
 
     result.is_deny = any(word in lowered for word in _DENY_WORDS)
-    result.is_confirm = (not result.is_deny) and any(
-        word in lowered for word in _CONFIRM_WORDS
-    )
+    result.is_confirm = (not result.is_deny) and _is_confirm_utterance(normalized)
     if result.intent == "other":
         result.intent = _detect_intent(normalized, result.is_confirm, result.is_deny)
     if not result.fields_to_correct and result.is_deny:
@@ -1248,6 +1337,11 @@ async def extract_info_async(
             timeout=_llm_timeout_s(),
         )
     except asyncio.TimeoutError:
+        logger.warning(
+            "extract_llm fallback expected=%s reason=timeout timeout_s=%.1f",
+            expected_field,
+            _llm_timeout_s(),
+        )
         return rule_result
     result = _apply_llm_obj(result, llm_obj, normalized, expected_field)
     return _finalize_extract(result, normalized, expected_field)
