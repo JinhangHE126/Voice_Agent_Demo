@@ -117,6 +117,16 @@ def test_expected_name_strips_conversational_suffix() -> None:
     assert out.customer_name == "胡先生"
 
 
+def test_expected_name_strips_asr_conversational_tail() -> None:
+    out = extract_info("你叫我何先生著好了", expected_field="customer_name")
+    assert out.customer_name == "何先生"
+
+
+def test_expected_name_rejects_greeting_and_laughter_noise() -> None:
+    out = extract_info("好，呵呵吸", expected_field="customer_name")
+    assert out.customer_name is None
+
+
 def test_expected_name_rejects_incomplete_call_me_phrase() -> None:
     out = extract_info("你可以叫我", expected_field="customer_name")
     assert out.customer_name is None
@@ -151,6 +161,19 @@ def test_expected_repair_accepts_actual_device_detail() -> None:
     assert out.repair_description == "我要维修电脑主机"
 
 
+def test_expected_repair_rejects_greeting_only() -> None:
+    out = extract_info("喂，你好", expected_field="repair_description")
+    assert out.repair_description is None
+
+
+def test_repair_strips_leading_greeting() -> None:
+    out = extract_info(
+        "喂，你好，我电脑主机坏了",
+        expected_field="repair_description",
+    )
+    assert out.repair_description == "我电脑主机坏了"
+
+
 def test_long_repair_description_is_summarized() -> None:
     out = extract_info(
         "你好，我今天早上电脑主机突然打不开了，"
@@ -158,6 +181,15 @@ def test_long_repair_description_is_summarized() -> None:
         expected_field="repair_description",
     )
     assert out.repair_description == "电脑主机打不开，进水了"
+
+
+def test_repair_summary_keeps_cause_hazard_and_current_state() -> None:
+    out = extract_info(
+        "喂，你好，我电脑主机坏掉了，它昨晚不小心进了一点水，"
+        "然后还冒烟了，我就不敢动，然后那个今天就打不开了。",
+        expected_field="repair_description",
+    )
+    assert out.repair_description == "电脑主机坏掉了，进水，冒烟了，打不开"
 
 
 def test_extract_intent_and_fields_to_correct() -> None:
@@ -170,6 +202,11 @@ def test_extract_intent_and_fields_to_correct() -> None:
 def test_extract_address_from_phrase() -> None:
     out = extract_info("地址係旺角弥敦道100号")
     assert out.customer_address == "旺角弥敦道100号"
+
+
+def test_expected_address_rejects_greeting_only() -> None:
+    out = extract_info("喂，你好", expected_field="customer_address")
+    assert out.customer_address is None
 
 
 def test_repair_address_phrase_does_not_become_repair_content() -> None:

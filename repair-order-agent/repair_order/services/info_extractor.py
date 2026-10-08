@@ -45,6 +45,12 @@ _INCOMPLETE_NAME_PHRASES = {
     "都可以",
 }
 _NAME_TRAILING_FILLERS = (
+    "著好了",
+    "着好了",
+    "就好了",
+    "就好啦",
+    "就好喇",
+    "就好",
     "就可以了",
     "就可以",
     "就行了",
@@ -54,6 +60,14 @@ _NAME_TRAILING_FILLERS = (
     "就得",
     "可以了",
     "得啦",
+)
+_NAME_REJECT_SUBSTRINGS = (
+    "呵呵",
+    "哈哈",
+    "你好",
+    "您好",
+    "明白",
+    "收到",
 )
 
 _CN_DIGIT_MAP = {
@@ -124,6 +138,12 @@ _REPAIR_MARKERS = (
     "唔凍",
     "不制冷",
     "漏水",
+    "冒烟",
+    "冒煙",
+    "烧焦",
+    "燒焦",
+    "漏电",
+    "漏電",
     "跳闸",
     "识别",
     "識別",
@@ -188,6 +208,12 @@ _REPAIR_FAULT_MARKERS = (
     "進水",
     "入水",
     "漏水",
+    "冒烟",
+    "冒煙",
+    "烧焦",
+    "燒焦",
+    "漏电",
+    "漏電",
     "跳闸",
     "跳掣",
     "异响",
@@ -201,6 +227,60 @@ _REPAIR_FAULT_MARKERS = (
     "壞",
     "故障",
 )
+_REPAIR_DEVICE_MARKERS = (
+    "电脑",
+    "電腦",
+    "主机",
+    "主機",
+    "笔记本",
+    "筆記本",
+    "冷气",
+    "冷氣",
+    "空调",
+    "空調",
+    "冰箱",
+    "洗衣机",
+    "洗衣機",
+    "电视",
+    "電視",
+    "打印机",
+    "打印機",
+    "门锁",
+    "門鎖",
+    "机器",
+    "機器",
+    "设备",
+    "設備",
+)
+_REPAIR_HAZARD_MARKERS = (
+    "冒烟",
+    "冒煙",
+    "烧焦",
+    "燒焦",
+    "焦味",
+    "异味",
+    "異味",
+    "漏电",
+    "漏電",
+    "火花",
+)
+_REPAIR_CAUSE_MARKERS = (
+    "进水",
+    "進水",
+    "入水",
+    "受潮",
+    "摔",
+    "跌",
+    "撞",
+)
+_REPAIR_REACTION_ONLY_MARKERS = (
+    "不敢动",
+    "不敢碰",
+    "冇敢郁",
+    "没敢动",
+    "先放着",
+    "先放住",
+)
 _REPAIR_TIME_RE = re.compile(
     r"(?:今天|今日|昨天|尋日|昨晚|琴晚)"
     r"(?:早上|朝早|上午|中午|下午|晚上|夜晚)?"
@@ -208,6 +288,31 @@ _REPAIR_TIME_RE = re.compile(
 _REPAIR_LEADING_FILLER_RE = re.compile(
     r"^(?:(?:你好|您好|喂|哎|唉|好的|好嘅|嗯|嗱)[呀啊哦喔]*"
     r"[\s，。,.!！?？]*)+"
+)
+
+_SOCIAL_ONLY_TOKENS = (
+    "hello",
+    "hi",
+    "喂",
+    "你好",
+    "您好",
+    "嗨",
+    "嗯",
+    "哦",
+    "噢",
+    "啊",
+    "呀",
+    "呵呵",
+    "哈哈",
+    "好的",
+    "好嘅",
+    "好",
+    "明白",
+    "收到",
+    "谢谢",
+    "謝謝",
+    "唔该",
+    "唔該",
 )
 
 _ADDRESS_MARKERS = (
@@ -238,6 +343,9 @@ _LLM_EXTRACTOR_PROMPT = (
     "你是电话维修工单的结构化抽取器。只输出一个JSON对象，不要解释。\n"
     "字段要求：name, phone, address, repair, intent, fields_to_correct, lang, confidence, evidence。\n"
     "name/phone/address/repair 无法确定时必须是 null。\n"
+    "不得把寒暄、语气词、请求脚手架当作字段；name只保留姓名/称呼，"
+    "去掉“就好了/就行”等尾巴；repair必须包含设备或实际故障信息。\n"
+    "每个非空字段必须能在用户原文中找到对应 evidence，禁止猜测或补写。\n"
     "intent 只能是 provide_info|confirm|deny|use_ani|transfer|other。\n"
     "fields_to_correct 只允许 customer_name/customer_phone/customer_address/repair_description。\n"
     "confidence 为0到1的小数；evidence给出原文证据片段。"
@@ -488,6 +596,18 @@ def _phone_error_for(candidate: str | None) -> str | None:
     return None
 
 
+def _is_social_only(text: str | None) -> bool:
+    compact = re.sub(r"[\s，。,.!！?？、:：;；\-—]+", "", (text or "").lower())
+    if not compact:
+        return True
+    previous = None
+    while compact and compact != previous:
+        previous = compact
+        for token in sorted(_SOCIAL_ONLY_TOKENS, key=len, reverse=True):
+            compact = compact.replace(token, "")
+    return not compact
+
+
 def _extract_name(text: str) -> str | None:
     match = _SELF_NAME_RE.search(text)
     if match:
@@ -519,11 +639,32 @@ def _normalize_name(
     candidate = (text or "").strip(" ，。,.!！?？")
     if not candidate:
         return None
-    for suffix in _NAME_TRAILING_FILLERS:
-        if candidate.endswith(suffix):
-            candidate = candidate[: -len(suffix)].strip(" ，。,.!！?？")
+    while candidate:
+        removed = False
+        for suffix in _NAME_TRAILING_FILLERS:
+            if candidate.endswith(suffix):
+                candidate = candidate[: -len(suffix)].strip(" ，。,.!！?？")
+                removed = True
+                break
+        if not removed:
             break
+
+    # When the answer contains a clear title, keep only the actual name and
+    # discard ASR/conversational tails such as "何先生著好了".
+    title = _TITLE_NAME_RE.search(candidate)
+    if title and (
+        expected_field == "customer_name"
+        or any(cue in full_text for cue in _SELF_NAME_CUES)
+    ):
+        candidate = title.group(1).strip()
+
     if len(candidate) <= 1 and not full_text.startswith("我姓"):
+        return None
+    if _is_social_only(candidate):
+        return None
+    if any(token in candidate for token in _NAME_REJECT_SUBSTRINGS):
+        return None
+    if re.search(r"[，。,.!！?？、:：;；]", candidate):
         return None
     if candidate in _NON_NAME_TOKENS:
         return None
@@ -590,6 +731,8 @@ def _extract_address(text: str) -> str | None:
 def _address_valid(text: str | None) -> bool:
     t = (text or "").strip(" ，。,.!！?？")
     if not t:
+        return False
+    if _is_social_only(t):
         return False
     if t in _ADDRESS_TOO_VAGUE:
         return False
@@ -686,6 +829,11 @@ def _repair_valid(text: str | None) -> bool:
     t = (text or "").strip(" ，。,.!！?？")
     if not t:
         return False
+    if _is_social_only(t):
+        return False
+    t = _REPAIR_LEADING_FILLER_RE.sub("", t).strip(" ，。,.!！?？")
+    if not t:
+        return False
     if t in _REPAIR_TOO_VAGUE:
         return False
     if len(t) < 3:
@@ -696,23 +844,53 @@ def _repair_valid(text: str | None) -> bool:
     return bool(detail.strip(" ，。,.!！?？"))
 
 
+def _clean_repair_clause(text: str) -> str:
+    clause = text.strip()
+    clause = _REPAIR_LEADING_FILLER_RE.sub("", clause)
+    clause = _REPAIR_TIME_RE.sub("", clause)
+    clause = re.sub(r"^(?:我嘅|我的|我)\s*", "", clause)
+    clause = re.sub(
+        r"^(?:(?:然后|然後|跟住|之后|之後|后来|後來|嗰个|那個|那个|"
+        r"仲|还|還|它|佢|就)\s*)+",
+        "",
+        clause,
+    )
+    for filler in ("可能是", "可能係", "应该是", "應該係", "突然"):
+        clause = clause.replace(filler, "")
+    clause = re.sub(
+        r"(?:不小心)?(?:进|進|入)了?(?:一点|一點|啲)?水",
+        "进水",
+        clause,
+    )
+    clause = clause.replace("打不开了", "打不开")
+    clause = clause.replace("打唔开咗", "打唔开")
+    return clause.strip(" ，。,.!！?？；; ")
+
+
+def _repair_clause_score(clause: str) -> int:
+    if any(marker in clause for marker in _REPAIR_HAZARD_MARKERS):
+        return 100
+    if any(marker in clause for marker in _REPAIR_FAULT_MARKERS):
+        return 80
+    if any(marker in clause for marker in _REPAIR_CAUSE_MARKERS):
+        return 70
+    if any(marker in clause for marker in _REPAIR_DEVICE_MARKERS):
+        return 50
+    return 0
+
+
 def _summarize_repair_text(text: str | None) -> str:
     original = (text or "").strip(" ，。,.!！?？；; ")
+    original = _REPAIR_LEADING_FILLER_RE.sub("", original).strip(
+        " ，。,.!！?？；; "
+    )
     if len(original) <= 24:
         return original
 
     clauses = re.split(r"[，。；;,.!?！？]+", original)
-    summary_parts: list[str] = []
-    for raw_clause in clauses:
-        clause = raw_clause.strip()
-        if not clause:
-            continue
-        clause = _REPAIR_LEADING_FILLER_RE.sub("", clause)
-        clause = _REPAIR_TIME_RE.sub("", clause)
-        clause = re.sub(r"^(?:我嘅|我的|我)\s*", "", clause)
-        for filler in ("可能是", "可能係", "应该是", "應該係", "突然"):
-            clause = clause.replace(filler, "")
-        clause = clause.replace("打不开了", "打不开").strip()
+    scored_parts: list[tuple[int, str, int]] = []
+    for index, raw_clause in enumerate(clauses):
+        clause = _clean_repair_clause(raw_clause)
         if not clause:
             continue
 
@@ -720,12 +898,35 @@ def _summarize_repair_text(text: str | None) -> str:
             any(x in clause for x in ("维修", "維修", "修一下", "整一下"))
             and not any(x in clause for x in _REPAIR_FAULT_MARKERS)
         )
-        if request_only and summary_parts:
+        if request_only:
             continue
-        if clause not in summary_parts:
-            summary_parts.append(clause)
+        if (
+            any(x in clause for x in _REPAIR_REACTION_ONLY_MARKERS)
+            and _repair_clause_score(clause) == 0
+        ):
+            continue
+        score = _repair_clause_score(clause)
+        if score > 0 and clause not in {item[1] for item in scored_parts}:
+            scored_parts.append((index, clause, score))
 
-    summary = "，".join(summary_parts[:2]) or original
+    # Always preserve the clause that identifies the device, then retain the
+    # three most important fault facts. Restore source order for readability.
+    device_part = next(
+        (
+            item
+            for item in scored_parts
+            if any(marker in item[1] for marker in _REPAIR_DEVICE_MARKERS)
+        ),
+        None,
+    )
+    remaining = [item for item in scored_parts if item is not device_part]
+    selected = sorted(remaining, key=lambda item: (-item[2], item[0]))[:3]
+    if device_part is not None:
+        selected.append(device_part)
+    selected.sort(key=lambda item: item[0])
+
+    summary_parts = [item[1] for item in selected]
+    summary = "，".join(summary_parts) or original
     if len(summary) > 40:
         summary = summary[:40].rstrip(" ，。,.!！?？；; ")
     return summary
