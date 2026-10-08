@@ -215,6 +215,32 @@ def test_short_cantonese_confirmation_still_works() -> None:
     assert extract_info("係").is_confirm is True
     assert extract_info("嗯，係啊").is_confirm is True
     assert extract_info("啱").is_confirm is True
+    assert extract_info("可以").is_confirm is True
+    assert extract_info("就这样").is_confirm is True
+    assert extract_info("冇问题").is_confirm is True
+    assert extract_info("好的").is_confirm is True
+    assert extract_info("对的对的，对的。对的对的。喂。").is_confirm is True
+
+
+def test_expected_name_rejects_asr_sentence() -> None:
+    out = extract_info("来搞我开了。", expected_field="customer_name")
+    assert out.customer_name is None
+
+
+def test_expected_name_accepts_conservative_standalone_names() -> None:
+    assert extract_info("陈大文", expected_field="customer_name").customer_name == "陈大文"
+    assert extract_info("Peter", expected_field="customer_name").customer_name == "Peter"
+
+
+def test_repair_summary_preserves_all_independent_faults() -> None:
+    out = extract_info(
+        "你好，我电脑主机坏掉了，它昨天晚上进了点水，然后主机有点冒烟，"
+        "现在风扇也不转了，然后开机也没有反应，耳机也没有声音。",
+        expected_field="repair_description",
+    )
+    repair = out.repair_description or ""
+    for fact in ("进了点水", "冒烟", "风扇也不转", "开机也没有反应", "耳机也没有声音"):
+        assert fact in repair
 
 
 def test_expected_address_rejects_greeting_only() -> None:

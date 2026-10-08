@@ -128,12 +128,44 @@ _CONFIRM_FULL_UTTERANCES = {
     "無錯",
     "无错",
     "yes",
+    "yep",
+    "yeah",
+    "sure",
     "ok",
     "okay",
     "冇问题",
     "冇問題",
+    "冇问题啊",
+    "冇問題啊",
+    "没问题",
+    "沒問題",
     "没有问题",
     "沒有問題",
+    "可以",
+    "可以啊",
+    "可以呀",
+    "可以啦",
+    "就这样",
+    "就這樣",
+    "就咁",
+    "就咁啦",
+    "就咁啊",
+    "行",
+    "行啊",
+    "行啦",
+    "得",
+    "得啦",
+    "好",
+    "好啊",
+    "好呀",
+    "好啦",
+    "好的",
+    "嗯",
+    "嗯嗯",
+    "确认",
+    "確認",
+    "没问题啊",
+    "沒問題啊",
 }
 _DENY_WORDS = {
     "唔啱",
@@ -224,7 +256,12 @@ _REPAIR_FAULT_MARKERS = (
     "無法",
     "进水",
     "進水",
+    "进了水",
+    "進了水",
+    "进了点水",
+    "進了點水",
     "入水",
+    "入咗水",
     "漏水",
     "冒烟",
     "冒煙",
@@ -236,7 +273,21 @@ _REPAIR_FAULT_MARKERS = (
     "跳掣",
     "异响",
     "異響",
+    "不转",
+    "不轉",
+    "唔转",
+    "唔轉",
+    "没有声音",
+    "沒有聲音",
+    "冇声音",
+    "冇聲音",
+    "无声",
+    "無聲",
     "没反应",
+    "没有反应",
+    "沒有反應",
+    "无反应",
+    "無反應",
     "冇反應",
     "唔冻",
     "唔凍",
@@ -285,7 +336,12 @@ _REPAIR_HAZARD_MARKERS = (
 _REPAIR_CAUSE_MARKERS = (
     "进水",
     "進水",
+    "进了水",
+    "進了水",
+    "进了点水",
+    "進了點水",
     "入水",
+    "入咗水",
     "受潮",
     "摔",
     "跌",
@@ -361,14 +417,17 @@ _LLM_EXTRACTOR_PROMPT = (
     "你是电话维修工单的结构化抽取器。只输出一个JSON对象，不要解释。\n"
     "只抽取两个字段：repair_description 与 customer_address。\n"
     "输出JSON示例："
-    '{"repair_description":"电脑主机进水，耳机无声","repair_evidence":["进了点水","耳机没有声音"],'
+    '{"repair_description":"电脑主机进水并冒烟，风扇不转，无法开机，耳机无声",'
+    '"repair_evidence":["进了点水","主机有点冒烟","风扇也不转了","开机也没有反应","耳机也没有声音"],'
     '"customer_address":null,"address_evidence":null,"confidence":{"repair":0.9,"address":0.0}}。\n'
     "规则：\n"
     "1. 无法确定时该字段必须是 null，对应 evidence 也是 null。\n"
     "2. 禁止猜测、补写、改写地址中的数字/楼层/房号。\n"
-    "3. repair_description 只保留设备与真实故障，去掉寒暄与“帮我修一下”等脚手架。\n"
+    "3. repair_description 必须保留原文中每一个独立故障、原因、危险现象和当前状态；"
+    "不得为了简短而遗漏任何一项，只去掉寒暄与“帮我修一下”等脚手架。\n"
     "4. customer_address 只保留地址本身，去掉“地址是/住址在”等前缀。\n"
-    "5. evidence 必须是用户原文中的连续片段；非空字段必须至少有一条 evidence。\n"
+    "5. repair_evidence 必须逐项列出每个独立故障/原因/危险现象的原文连续片段，"
+    "非空字段必须有 evidence。\n"
     "6. 不要输出姓名、电话、intent、确认/否认等其他字段。"
 )
 
@@ -778,6 +837,37 @@ def _extract_repair(text: str) -> str | None:
     return None
 
 
+def _standalone_name_valid(candidate: str) -> bool:
+    """Conservative validation for a short answer to the name question."""
+    if re.fullmatch(r"[\u3400-\u9fff]{2,4}", candidate):
+        # Prefer asking again over persisting an ASR sentence as a name.
+        return not any(
+            token in candidate
+            for token in (
+                "我",
+                "你",
+                "佢",
+                "叫",
+                "係",
+                "是",
+                "了",
+                "啦",
+                "啊",
+                "呀",
+                "喂",
+                "说",
+                "說",
+                "话",
+                "話",
+                "搞",
+                "开",
+                "開",
+                "拍",
+            )
+        )
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z' -]{1,29}", candidate))
+
+
 def _normalize_name(
     text: str | None,
     full_text: str,
@@ -822,7 +912,9 @@ def _normalize_name(
         return None
 
     if expected_field == "customer_name":
-        if len(candidate) > 20:
+        has_self_cue = any(cue in full_text for cue in _SELF_NAME_CUES)
+        has_title = bool(_TITLE_NAME_RE.fullmatch(candidate))
+        if not (has_self_cue or has_title or _standalone_name_valid(candidate)):
             return None
         if any(x in candidate for x in ("电话", "電話", "维修", "維修")):
             return None
@@ -948,13 +1040,53 @@ def _detect_intent(text: str, is_confirm: bool, is_deny: bool) -> str:
 def _is_confirm_utterance(text: str) -> bool:
     """Accept confirmation replies, but never treat copulas inside facts as yes."""
     compact = re.sub(r"[\s，。,.!！?？、]+", "", text.lower())
+    for filler in ("喂", "嗯", "啊", "呀", "哦"):
+        compact = compact.removesuffix(filler)
     if compact in _CONFIRM_FULL_UTTERANCES:
         return True
     # Natural acknowledgements such as “嗯，係啊” and “好，啱”.
-    for prefix in ("嗯嗯", "嗯", "好的", "好"):
-        if compact.startswith(prefix) and compact[len(prefix) :] in _CONFIRM_FULL_UTTERANCES:
+    for prefix in ("嗯嗯", "嗯", "好的", "好啊", "好呀", "好啦", "好"):
+        if (
+            compact.startswith(prefix)
+            and compact[len(prefix) :] in _CONFIRM_FULL_UTTERANCES
+        ):
             return True
+    # ASR often repeats a short confirmation: “对的对的，对的。喂。”
+    remainder = compact
+    consumed = False
+    repeatable = sorted(
+        (
+            token
+            for token in _CONFIRM_FULL_UTTERANCES
+            if token not in {"好", "嗯", "嗯嗯", "係", "是", "对", "對"}
+        ),
+        key=len,
+        reverse=True,
+    )
+    while remainder:
+        matched = next((token for token in repeatable if remainder.startswith(token)), None)
+        if matched is None:
+            break
+        consumed = True
+        remainder = remainder[len(matched) :]
+    if consumed and not remainder:
+        return True
     return False
+
+
+def _utterance_may_need_llm_fields(text: str) -> bool:
+    """Only call DeepSeek when the turn likely carries repair/address content."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if any(marker in stripped for marker in _ADDRESS_MARKERS):
+        return True
+    if any(marker in stripped for marker in _REPAIR_MARKERS) and not any(
+        phrase in stripped for phrase in _NON_REPAIR_PHRASES
+    ):
+        return True
+    # Longer free-form replies may still hide soft repair/address wording.
+    return len(stripped) >= 16
 
 
 def _normalize_conf(conf: object) -> dict[str, float]:
@@ -1069,26 +1201,12 @@ def _summarize_repair_text(text: str | None) -> str:
         if score > 0 and clause not in {item[1] for item in scored_parts}:
             scored_parts.append((index, clause, score))
 
-    # Always preserve the clause that identifies the device, then retain the
-    # three most important fault facts. Restore source order for readability.
-    device_part = next(
-        (
-            item
-            for item in scored_parts
-            if any(marker in item[1] for marker in _REPAIR_DEVICE_MARKERS)
-        ),
-        None,
-    )
-    remaining = [item for item in scored_parts if item is not device_part]
-    selected = sorted(remaining, key=lambda item: (-item[2], item[0]))[:3]
-    if device_part is not None:
-        selected.append(device_part)
-    selected.sort(key=lambda item: item[0])
-
-    summary_parts = [item[1] for item in selected]
+    # Preserve all independent facts. Repair records value completeness over
+    # aggressive shortening; cap only pathological transcripts.
+    summary_parts = [item[1] for item in scored_parts[:8]]
     summary = "，".join(summary_parts) or original
-    if len(summary) > 40:
-        summary = summary[:40].rstrip(" ，。,.!！?？；; ")
+    if len(summary) > 100:
+        summary = summary[:100].rstrip(" ，。,.!！?？；; ")
     return summary
 
 
@@ -1104,7 +1222,7 @@ def _apply_expected_field_fallback(
         title = _TITLE_NAME_RE.fullmatch(stripped)
         if title:
             result.customer_name = title.group(1)
-        elif 1 < len(stripped) <= 12 and not _DIGIT_ONLY_RE.match(stripped):
+        elif _standalone_name_valid(stripped):
             result.customer_name = _normalize_name(
                 stripped, text, expected_field="customer_name"
             )
@@ -1275,6 +1393,7 @@ def _finalize_extract(
 def _rules_are_sufficient(
     result: ExtractResult,
     expected_field: str | None,
+    text: str = "",
 ) -> bool:
     # Control intents are deterministic and should never wait on a network
     # model. Denials also carry heuristic fields_to_correct when provided.
@@ -1294,10 +1413,15 @@ def _rules_are_sufficient(
     ):
         return True
 
-    # repair / address (or free-form turns that may contain them): prefer LLM.
+    # repair / address turns: prefer DeepSeek for record quality.
     if expected_field in _LLM_FIELDS:
         return False
+
+    # Confirming / free-form (expected_field is None): skip DeepSeek unless the
+    # utterance looks like it may correct repair or address content.
     if result.repair_description and result.customer_address:
+        return True
+    if not _utterance_may_need_llm_fields(text):
         return True
     return False
 
@@ -1312,7 +1436,9 @@ def extract_info(
     if not normalized:
         return result
     rule_result = _finalize_extract(ExtractResult(), normalized, expected_field)
-    if _rules_are_sufficient(rule_result, expected_field):
+    if _rules_are_sufficient(rule_result, expected_field, normalized):
+        return rule_result
+    if not _llm_enabled():
         return rule_result
     llm_obj = _llm_extract(normalized, expected_field=expected_field)
     result = _apply_llm_obj(result, llm_obj, normalized, expected_field)
@@ -1329,7 +1455,9 @@ async def extract_info_async(
     if not normalized:
         return result
     rule_result = _finalize_extract(ExtractResult(), normalized, expected_field)
-    if _rules_are_sufficient(rule_result, expected_field):
+    if _rules_are_sufficient(rule_result, expected_field, normalized):
+        return rule_result
+    if not _llm_enabled():
         return rule_result
     try:
         llm_obj = await asyncio.wait_for(
