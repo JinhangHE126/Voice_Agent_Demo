@@ -157,3 +157,19 @@ def test_confirming_address_correction_still_calls_llm(monkeypatch) -> None:
     out = extract_info("地址改成旺角弥敦道100号", expected_field=None)
     assert called["n"] == 1
     assert out.customer_address == "旺角弥敦道100号"
+
+
+def test_low_information_repair_turn_skips_llm(monkeypatch) -> None:
+    called = {"n": 0}
+
+    def _fake_llm(text: str, *, expected_field: str | None = None):
+        called["n"] += 1
+        return {"repair_description": "不应调用"}
+
+    monkeypatch.setattr(ie, "_llm_extract", _fake_llm)
+    monkeypatch.setenv("REPAIR_ORDER_USE_LLM_EXTRACTOR", "1")
+
+    for text in ("喂。", "Oi.", "嗯，说话。"):
+        out = extract_info(text, expected_field="repair_description")
+        assert out.repair_description is None
+    assert called["n"] == 0

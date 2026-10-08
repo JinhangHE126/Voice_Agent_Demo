@@ -815,6 +815,30 @@ def _is_social_only(text: str | None) -> bool:
     return not compact
 
 
+def _is_low_information_utterance(text: str | None) -> bool:
+    compact = re.sub(r"[\s，。,.!！?？、:：;；\-—]+", "", (text or "").lower())
+    if not compact or _is_social_only(compact):
+        return True
+    previous = None
+    while compact and compact != previous:
+        previous = compact
+        for token in sorted(_SOCIAL_ONLY_TOKENS, key=len, reverse=True):
+            if compact.startswith(token):
+                compact = compact[len(token) :]
+                break
+    return len(compact) <= 2 or compact in {
+        "说话",
+        "說話",
+        "讲话",
+        "講話",
+        "听到吗",
+        "聽到嗎",
+        "有人吗",
+        "有人嗎",
+        "oi",
+    }
+
+
 def _extract_name(text: str) -> str | None:
     match = _SELF_NAME_RE.search(text)
     if match:
@@ -1398,6 +1422,8 @@ def _rules_are_sufficient(
     # Control intents are deterministic and should never wait on a network
     # model. Denials also carry heuristic fields_to_correct when provided.
     if result.intent in {"confirm", "deny", "set_language", "use_ani", "transfer"}:
+        return True
+    if _is_low_information_utterance(text):
         return True
 
     # Name/phone are rule-owned. Never call the extract LLM for them.
