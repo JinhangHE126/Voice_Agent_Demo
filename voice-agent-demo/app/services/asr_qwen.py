@@ -163,7 +163,8 @@ class QwenRealtimeASR:
         self._partial = ""
         self._reader_task = asyncio.create_task(self._read_loop(ws))
 
-    async def _drop_connection(self, ws) -> None:
+    async def _detach_connection(self, ws) -> None:
+        """Stop routing events from a stale socket without waiting for close."""
         if self._ws is ws:
             self._ws = None
         reader = self._reader_task
@@ -179,6 +180,9 @@ class QwenRealtimeASR:
                 pass
         if self._reader_task is reader:
             self._reader_task = None
+
+    async def _drop_connection(self, ws) -> None:
+        await self._detach_connection(ws)
         if ws:
             try:
                 await ws.close()
@@ -314,6 +318,31 @@ class QwenRealtimeASR:
         fallback = (self._partial or "").strip()
         await self._dispatch_final(fallback, self.language or "yue")
 
+    async def _recover_failed_utterance(self, ws, *, reason: str) -> None:
+        """
+        Finalize with the last partial, then replace the connection.
+
+        A timed-out DashScope session must not be reused: a late completed
+        event from it can otherwise be mistaken for the next utterance.
+        """
+        fallback = (self._partial or "").strip()
+        logger.warning(
+            "Qwen ASR utterance failed (%s); dropping connection and "
+            "dispatching fallback chars=%d",
+            reason,
+            len(fallback),
+        )
+        # Detach first so a late completion cannot leak into the next turn.
+        # Dispatch the fallback before waiting for the WebSocket close
+        # handshake; close may otherwise add seconds of visible ENDPOINTING.
+        await self._detach_connection(ws)
+        await self._dispatch_final(fallback, self.language or "yue")
+        await self._drop_connection(ws)
+        if not self._closed:
+            # Pass the failed socket so a concurrent audio-triggered reconnect
+            # is preserved instead of being replaced again.
+            await self._reconnect(ws, force=True)
+
     async def end_utterance(self) -> None:
         """Commit one utterance and provide a timeout fallback final callback."""
         if self._closed:
@@ -323,6 +352,8 @@ class QwenRealtimeASR:
         ws = self._ws
         if ws is None:
             await self._finish_failed_utterance()
+            if not self._closed:
+                await self._reconnect(force=True)
             return
         try:
             await ws.send(
@@ -335,8 +366,7 @@ class QwenRealtimeASR:
             )
         except Exception as exc:
             logger.warning("Qwen ASR commit failed: %r", exc)
-            await self._drop_connection(ws)
-            await self._finish_failed_utterance()
+            await self._recover_failed_utterance(ws, reason="commit_failed")
             return
         # Avoid endless ENDPOINTING if cloud ASR never sends completed.
         try:
@@ -345,7 +375,7 @@ class QwenRealtimeASR:
                 timeout=self.final_timeout_ms / 1000.0,
             )
         except asyncio.TimeoutError:
-            await self._finish_failed_utterance()
+            await self._recover_failed_utterance(ws, reason="final_timeout")
 
     async def close(self) -> None:
         self._closed = True

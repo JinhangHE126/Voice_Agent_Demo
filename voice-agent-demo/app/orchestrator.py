@@ -117,6 +117,21 @@ class CallSession:
         os.environ["REPAIR_ORDER_EXTRACT_TIMEOUT_S"] = str(
             self.settings.repair_order_extract_timeout_s
         )
+        os.environ["REPAIR_ORDER_EXTRACT_PROVIDER"] = (
+            self.settings.repair_order_extract_provider.strip() or "deepseek"
+        )
+        os.environ["REPAIR_ORDER_EXTRACT_BASE_URL"] = (
+            self.settings.repair_order_extract_base_url.strip()
+            or "https://api.deepseek.com"
+        )
+        os.environ["REPAIR_ORDER_EXTRACT_MODEL"] = (
+            self.settings.repair_order_extract_model.strip() or "deepseek-flash"
+        )
+        extract_key = self.settings.resolved_extract_api_key()
+        if extract_key:
+            os.environ["REPAIR_ORDER_EXTRACT_API_KEY"] = extract_key
+            if self.settings.repair_order_extract_provider.strip().lower() != "dashscope":
+                os.environ["DEEPSEEK_API_KEY"] = extract_key
         self.prompts = PromptAudioBank(
             self.settings.resolved_prompt_audio_dir(),
             sample_rate=self.settings.sample_rate,
@@ -482,6 +497,10 @@ class CallSession:
             await self._emit("asr.final", {"text": "", "empty": True})
             await self._emit("state", {"state": self.state.value})
             self.vad.reset()
+            self._partial_text = ""
+            self._turn_clock = None
+            self._latency = LatencyMetrics()
+            self._barge_buffer.clear()
             return
 
         if self.state in {SessionState.THINKING, SessionState.SPEAKING}:
@@ -498,12 +517,16 @@ class CallSession:
             )
             self._asr_lang = lang or self._asr_lang
             self._reply_lang = detect_reply_lang(text, self._asr_lang)
+            # Temporary debug: keep a short preview so confirm-phase ASR
+            # mismatches can be tuned without dumping long utterances.
+            preview = text if len(text) <= 80 else f"{text[:80]}…"
             logger.info(
-                "asr_final call=%s lang=%s text_len=%d asr_final_ms=%s",
+                "asr_final call=%s lang=%s text_len=%d asr_final_ms=%s text=%r",
                 self.call_id,
                 self._asr_lang,
                 len(text),
                 self._latency.asr_final_ms,
+                preview,
             )
             self._first_audio_marked = False
             self._awaiting_playback_done = False

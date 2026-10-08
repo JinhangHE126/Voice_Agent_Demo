@@ -77,11 +77,13 @@ async def test_qwen_asr_reconnects_and_retries_audio_send(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_qwen_asr_commit_failure_dispatches_empty_final(monkeypatch) -> None:
-    ws = FakeWebSocket(fail_event="input_audio_buffer.commit")
+    first = FakeWebSocket(fail_event="input_audio_buffer.commit")
+    second = FakeWebSocket()
+    sockets = iter((first, second))
     finals: list[tuple[str, str]] = []
 
     async def fake_connect(*args, **kwargs):
-        return ws
+        return next(sockets)
 
     async def on_final(text: str, lang: str) -> None:
         finals.append((text, lang))
@@ -97,5 +99,88 @@ async def test_qwen_asr_commit_failure_dispatches_empty_final(monkeypatch) -> No
     await asr.end_utterance()
 
     assert finals == [("", "yue")]
+    assert asr._ws is second
 
+    await asr.close()
+
+
+@pytest.mark.asyncio
+async def test_qwen_asr_final_timeout_replaces_connection(monkeypatch) -> None:
+    first = FakeWebSocket()
+    second = FakeWebSocket()
+    sockets = iter((first, second))
+    connect_calls = 0
+    finals: list[tuple[str, str]] = []
+
+    async def fake_connect(*args, **kwargs):
+        nonlocal connect_calls
+        connect_calls += 1
+        return next(sockets)
+
+    async def on_final(text: str, lang: str) -> None:
+        finals.append((text, lang))
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+
+    asr = QwenRealtimeASR(
+        api_key="test",
+        language="yue",
+        final_timeout_ms=500,
+        on_final=on_final,
+    )
+    await asr.start()
+    await asr.end_utterance()
+
+    assert finals == [("", "yue")]
+    assert connect_calls == 2
+    assert first._closed.is_set()
+    assert asr._ws is second
+
+    await asr.close()
+
+
+@pytest.mark.asyncio
+async def test_timeout_dispatches_fallback_before_slow_socket_close(
+    monkeypatch,
+) -> None:
+    class SlowCloseWebSocket(FakeWebSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_started = asyncio.Event()
+            self.allow_close = asyncio.Event()
+
+        async def close(self) -> None:
+            self.close_started.set()
+            await self.allow_close.wait()
+            await super().close()
+
+    first = SlowCloseWebSocket()
+    second = FakeWebSocket()
+    sockets = iter((first, second))
+    final_called = asyncio.Event()
+
+    async def fake_connect(*args, **kwargs):
+        return next(sockets)
+
+    async def on_final(text: str, lang: str) -> None:
+        final_called.set()
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+
+    asr = QwenRealtimeASR(
+        api_key="test",
+        language="yue",
+        final_timeout_ms=500,
+        on_final=on_final,
+    )
+    await asr.start()
+    end_task = asyncio.create_task(asr.end_utterance())
+
+    await asyncio.wait_for(final_called.wait(), timeout=0.7)
+    assert not end_task.done()
+    assert asr._ws is None
+
+    first.allow_close.set()
+    await end_task
+    assert asr._ws is second
     await asr.close()
