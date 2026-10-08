@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from app.config import Settings
-from app.models import ServerEvent
+from app.models import ServerEvent, SessionState
 from app.orchestrator import CallSession
 from app.services.llm_router import FAQMatcher, GradedLLMRouter
 from app.services.text_norm import detect_reply_lang, split_for_tts
@@ -178,6 +178,63 @@ async def test_asr_watchdog_forces_end_when_no_partial_progress() -> None:
     assert any(e.type == "speech.ended" and e.data.get("manual") for e in events)
     assert session.state.value == "endpointing"
 
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_barge_in_preserves_vad_until_short_utterance_ends() -> None:
+    events: list[ServerEvent] = []
+
+    async def emit(ev: ServerEvent) -> None:
+        events.append(ev)
+
+    settings = Settings(
+        agent_mode="mock",
+        business_mode="faq",
+        input_denoise_enabled=False,
+        vad_silence_ms=40,
+        min_speech_ms=40,
+        vad_energy_threshold=100,
+        vad_webrtc_mode=None,
+        barge_in_min_ms=0,
+    )
+    session = CallSession(emit=emit, settings=settings, call_id="barge-vad")
+
+    class FakeASR:
+        def __init__(self) -> None:
+            self.pushed = bytearray()
+            self.end_called = asyncio.Event()
+
+        async def push_pcm16(self, pcm: bytes) -> None:
+            self.pushed.extend(pcm)
+
+        async def end_utterance(self) -> None:
+            self.end_called.set()
+
+        async def close(self) -> None:
+            return
+
+    fake_asr = FakeASR()
+    session._asr = fake_asr
+    session.state = SessionState.SPEAKING
+    session._speaking_started_at = 0.0
+
+    loud = b"\x00\x20" * 320
+    quiet = b"\x00\x00" * 320
+    await session.on_pcm16(loud)
+    await session.on_pcm16(loud)
+    assert session.state == SessionState.LISTENING
+    assert fake_asr.pushed
+
+    await session.on_pcm16(quiet)
+    await session.on_pcm16(quiet)
+    await asyncio.wait_for(fake_asr.end_called.wait(), timeout=0.5)
+
+    assert session.state == SessionState.ENDPOINTING
+    assert any(
+        event.type == "speech.started" and event.data.get("barge_in")
+        for event in events
+    )
     await session.close()
 
 

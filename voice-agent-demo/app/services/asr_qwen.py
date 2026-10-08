@@ -109,6 +109,13 @@ class QwenRealtimeASR:
         self._connect_lock = asyncio.Lock()
         self._last_connect_attempt = 0.0
         self._reconnect_cooldown_s = 1.0
+        self._reconnect_task: asyncio.Task | None = None
+        self._utterance_pcm = bytearray()
+        self._pre_roll_pcm = bytearray()
+        self._pre_roll_bytes = 16000 * 2 * 300 // 1000
+        self._max_replay_bytes = 16000 * 2 * 20
+        self._speech_capture_active = False
+        self._buffer_only_until_commit = False
 
     async def _dispatch_final(self, text: str, lang: str) -> None:
         async with self._dispatch_lock:
@@ -117,6 +124,10 @@ class QwenRealtimeASR:
             self._final_dispatched = True
             self._last_final = text
             self._partial = ""
+            self._utterance_pcm.clear()
+            self._pre_roll_pcm.clear()
+            self._speech_capture_active = False
+            self._buffer_only_until_commit = False
             self._final_event.set()
             if self.on_final:
                 await self.on_final(text, lang)
@@ -132,7 +143,7 @@ class QwenRealtimeASR:
         ws = await websockets.connect(
             url,
             additional_headers=headers,
-            open_timeout=15.0,
+            open_timeout=8.0,
             ping_interval=20.0,
             ping_timeout=20.0,
         )
@@ -220,15 +231,43 @@ class QwenRealtimeASR:
 
     async def start(self) -> None:
         self._closed = False
-        connected = await self._reconnect(force=True)
-        if not connected:
-            # Keep the browser call alive. Audio pushes will retry after the
-            # reconnect cooldown, which handles transient handshake failures
-            # without tearing down the client WebSocket.
-            logger.warning(
-                "Qwen ASR initial connection unavailable; "
-                "will retry when audio arrives"
-            )
+        self._schedule_reconnect(force=True)
+        # Connection warm-up runs behind the greeting instead of delaying it.
+        await asyncio.sleep(0)
+
+    def _schedule_reconnect(self, *, force: bool = False) -> None:
+        if self._closed:
+            return
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
+
+        async def run() -> None:
+            connected = await self._reconnect(force=force)
+            if not connected and not self._closed:
+                logger.warning(
+                    "Qwen ASR connection unavailable; "
+                    "buffering locally until utterance end"
+                )
+
+        task = asyncio.create_task(run())
+        self._reconnect_task = task
+
+        def clear(done: asyncio.Task) -> None:
+            if self._reconnect_task is done:
+                self._reconnect_task = None
+
+        task.add_done_callback(clear)
+
+    def mark_speech_start(self) -> None:
+        """Start a replayable utterance with 300ms of local pre-roll."""
+        if self._speech_capture_active:
+            return
+        self._utterance_pcm = bytearray(self._pre_roll_pcm)
+        self._pre_roll_pcm.clear()
+        self._speech_capture_active = True
+
+    def mark_speech_end(self) -> None:
+        self._speech_capture_active = False
 
     async def _read_loop(self, ws) -> None:
         try:
@@ -285,6 +324,26 @@ class QwenRealtimeASR:
     async def push_pcm16(self, pcm: bytes) -> None:
         if self._closed or not pcm:
             return
+        if self._speech_capture_active:
+            self._utterance_pcm.extend(pcm)
+            if len(self._utterance_pcm) > self._max_replay_bytes:
+                del self._utterance_pcm[:-self._max_replay_bytes]
+        else:
+            self._pre_roll_pcm.extend(pcm)
+            if len(self._pre_roll_pcm) > self._pre_roll_bytes:
+                del self._pre_roll_pcm[:-self._pre_roll_bytes]
+
+        ws = self._ws
+        if ws is None:
+            # Never hold up local VAD while a cloud handshake is pending.
+            self._buffer_only_until_commit = True
+            self._schedule_reconnect()
+            return
+        if self._buffer_only_until_commit:
+            # This socket connected after part of the utterance was missed.
+            # Keep it clean and submit the complete local buffer at EoU.
+            return
+
         payload = json.dumps(
             {
                 "event_id": self._event_id(),
@@ -292,31 +351,123 @@ class QwenRealtimeASR:
                 "audio": base64.b64encode(pcm).decode("ascii"),
             }
         )
-        ws = self._ws
-        if ws is None:
-            if not await self._reconnect():
-                return
-            ws = self._ws
         try:
             await ws.send(payload)
             return
         except Exception as exc:
-            logger.warning("Qwen ASR audio send failed; reconnecting: %r", exc)
-
-        if not await self._reconnect(ws):
-            return
-        retry_ws = self._ws
-        if retry_ws is None:
-            return
-        try:
-            await retry_ws.send(payload)
-        except Exception as exc:
-            logger.warning("Qwen ASR audio retry failed: %r", exc)
-            await self._drop_connection(retry_ws)
+            logger.warning(
+                "Qwen ASR audio send failed; buffering until EoU: %r",
+                exc,
+            )
+        self._buffer_only_until_commit = True
+        await self._detach_connection(ws)
+        self._schedule_reconnect(force=True)
 
     async def _finish_failed_utterance(self) -> None:
         fallback = (self._partial or "").strip()
         await self._dispatch_final(fallback, self.language or "yue")
+
+    def _buffered_timeout_s(self, audio: bytes) -> float:
+        duration_s = len(audio) / 2 / 16000
+        # Replayed audio is uploaded faster than realtime, but long utterances
+        # still need more processing time than the normal streaming final.
+        return max(
+            self.final_timeout_ms / 1000.0,
+            min(10.0, 2.0 + duration_s * 0.6),
+        )
+
+    async def _wait_for_connection(self) -> bool:
+        task = self._reconnect_task
+        if task and not task.done():
+            try:
+                await task
+            except asyncio.CancelledError:
+                return False
+        if self._ws is not None:
+            return True
+        return await self._reconnect(force=True)
+
+    async def _submit_buffered_utterance(
+        self,
+        *,
+        failed_ws=None,
+        reconnect: bool,
+        label: str,
+    ) -> bool:
+        """Submit the locally bounded speech buffer and wait for a final."""
+        audio = bytes(self._utterance_pcm)
+        if not audio or self._closed:
+            return False
+        logger.warning(
+            "Qwen ASR submitting buffered utterance label=%s bytes=%d duration_ms=%.1f",
+            label,
+            len(audio),
+            len(audio) / 2 / 16000 * 1000.0,
+        )
+        if reconnect:
+            await self._detach_connection(failed_ws)
+            if failed_ws:
+                try:
+                    await asyncio.wait_for(failed_ws.close(), timeout=0.25)
+                except Exception:
+                    pass
+            if not await self._reconnect(force=True):
+                return False
+        elif not await self._wait_for_connection():
+            return False
+
+        submit_ws = self._ws
+        if submit_ws is None:
+            return False
+        self._final_event.clear()
+        self._final_dispatched = False
+        timeout_s = self._buffered_timeout_s(audio)
+        try:
+            # Moderate chunks avoid one very large JSON/WebSocket frame.
+            chunk_bytes = 3200
+            for offset in range(0, len(audio), chunk_bytes):
+                chunk = audio[offset : offset + chunk_bytes]
+                await submit_ws.send(
+                    json.dumps(
+                        {
+                            "event_id": self._event_id(),
+                            "type": "input_audio_buffer.append",
+                            "audio": base64.b64encode(chunk).decode("ascii"),
+                        }
+                    )
+                )
+            await submit_ws.send(
+                json.dumps(
+                    {
+                        "event_id": self._event_id(),
+                        "type": "input_audio_buffer.commit",
+                    }
+                )
+            )
+            await asyncio.wait_for(
+                self._final_event.wait(),
+                timeout=timeout_s,
+            )
+            logger.info(
+                "Qwen ASR buffered utterance succeeded label=%s timeout_s=%.1f",
+                label,
+                timeout_s,
+            )
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Qwen ASR buffered utterance timed out label=%s timeout_s=%.1f",
+                label,
+                timeout_s,
+            )
+            return False
+        except Exception as exc:
+            logger.warning(
+                "Qwen ASR buffered utterance failed label=%s: %r",
+                label,
+                exc,
+            )
+            return False
 
     async def _recover_failed_utterance(self, ws, *, reason: str) -> None:
         """
@@ -350,10 +501,26 @@ class QwenRealtimeASR:
         self._final_event.clear()
         self._final_dispatched = False
         ws = self._ws
+        if self._buffer_only_until_commit:
+            if await self._submit_buffered_utterance(
+                failed_ws=ws,
+                reconnect=False,
+                label="connection_gap",
+            ):
+                return
+            await self._recover_failed_utterance(
+                self._ws or ws,
+                reason="buffered_submit_failed",
+            )
+            return
         if ws is None:
+            if await self._submit_buffered_utterance(
+                reconnect=False,
+                label="disconnected",
+            ):
+                return
             await self._finish_failed_utterance()
-            if not self._closed:
-                await self._reconnect(force=True)
+            self._schedule_reconnect(force=True)
             return
         try:
             await ws.send(
@@ -366,7 +533,16 @@ class QwenRealtimeASR:
             )
         except Exception as exc:
             logger.warning("Qwen ASR commit failed: %r", exc)
-            await self._recover_failed_utterance(ws, reason="commit_failed")
+            if await self._submit_buffered_utterance(
+                failed_ws=ws,
+                reconnect=True,
+                label="commit_retry",
+            ):
+                return
+            await self._recover_failed_utterance(
+                self._ws or ws,
+                reason="commit_failed",
+            )
             return
         # Avoid endless ENDPOINTING if cloud ASR never sends completed.
         try:
@@ -375,10 +551,30 @@ class QwenRealtimeASR:
                 timeout=self.final_timeout_ms / 1000.0,
             )
         except asyncio.TimeoutError:
-            await self._recover_failed_utterance(ws, reason="final_timeout")
+            # If DashScope produced no partial at all, replay the locally
+            # buffered utterance once on a fresh connection before giving up.
+            if not self._partial:
+                if await self._submit_buffered_utterance(
+                    failed_ws=ws,
+                    reconnect=True,
+                    label="final_retry",
+                ):
+                    return
+            await self._recover_failed_utterance(
+                self._ws or ws,
+                reason="final_timeout",
+            )
 
     async def close(self) -> None:
         self._closed = True
+        reconnect_task = self._reconnect_task
+        if reconnect_task and not reconnect_task.done():
+            reconnect_task.cancel()
+            try:
+                await reconnect_task
+            except asyncio.CancelledError:
+                pass
+        self._reconnect_task = None
         ws = self._ws
         if ws:
             try:

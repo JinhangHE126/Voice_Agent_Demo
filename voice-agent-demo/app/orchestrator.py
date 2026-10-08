@@ -283,6 +283,16 @@ class CallSession:
             self._asr_watchdog_task.cancel()
         self._asr_watchdog_task = None
 
+    def _mark_asr_speech_start(self) -> None:
+        marker = getattr(self._asr, "mark_speech_start", None)
+        if callable(marker):
+            marker()
+
+    def _mark_asr_speech_end(self) -> None:
+        marker = getattr(self._asr, "mark_speech_end", None)
+        if callable(marker):
+            marker()
+
     async def _start_asr_watchdog(self, *, generation_id: int) -> None:
         self._cancel_asr_watchdog()
         timeout_ms = max(0, int(self.settings.asr_no_progress_timeout_ms))
@@ -384,9 +394,25 @@ class CallSession:
                         threshold,
                     )
                     buffered = bytes(self._barge_buffer)
-                    await self._handle_barge_in()
+                    barge_speech_started_at = self._barge_started_at
+                    await self._handle_barge_in(
+                        preserve_vad=True,
+                        speech_started_at=barge_speech_started_at,
+                    )
+                    self._mark_asr_speech_start()
                     if self._asr and buffered:
                         await self._asr.push_pcm16(buffered)
+                    await self._start_asr_watchdog(
+                        generation_id=self.generation_id
+                    )
+                    await self._emit(
+                        "speech.started",
+                        {
+                            "barge_in": True,
+                            "energy": round(energy, 1),
+                            "threshold": round(threshold, 1),
+                        },
+                    )
             return
 
         if self.state not in {SessionState.LISTENING}:
@@ -397,6 +423,7 @@ class CallSession:
 
         ev = self.vad.accept(pcm)
         if ev["event"] == "speech_start":
+            self._mark_asr_speech_start()
             now = time.perf_counter()
             self._speech_started_at = now
             self._asr_last_partial_at = None
@@ -416,6 +443,7 @@ class CallSession:
                 },
             )
         elif ev["event"] == "speech_end":
+            self._mark_asr_speech_end()
             logger.info(
                 "speech_end call=%s reason=%s speech_ms=%s voiced_ratio=%s",
                 self.call_id,
@@ -442,6 +470,7 @@ class CallSession:
     async def force_end_utterance(self) -> None:
         if self.state != SessionState.LISTENING:
             return
+        self._mark_asr_speech_end()
         if self._turn_clock is None:
             self._turn_clock = time.perf_counter()
             self._latency = LatencyMetrics(eou_ms=0.0)
@@ -968,12 +997,30 @@ class CallSession:
         self._turn_clock = None
         self._speaking_started_at = None
 
-    async def _handle_barge_in(self) -> None:
+    async def _handle_barge_in(
+        self,
+        *,
+        preserve_vad: bool = False,
+        speech_started_at: float | None = None,
+    ) -> None:
         self.state = SessionState.BARGE_IN
         self._awaiting_playback_done = False
         await self._emit("barge_in", {})
         await self._cancel_generation()
-        self._finish_listening()
+        if preserve_vad:
+            # VAD is already inside the user's speech. Keep that state so the
+            # following silence produces speech_end instead of swallowing the
+            # short barge-in utterance.
+            self.state = SessionState.LISTENING
+            self._barge_buffer.clear()
+            self._barge_started_at = None
+            self._speech_started_at = speech_started_at or time.perf_counter()
+            self._asr_last_partial_at = None
+            self._asr_watchdog_tripped = False
+            self._turn_clock = None
+            self._speaking_started_at = None
+        else:
+            self._finish_listening()
         await self._emit("state", {"state": self.state.value})
 
     async def _cancel_generation(self) -> None:
