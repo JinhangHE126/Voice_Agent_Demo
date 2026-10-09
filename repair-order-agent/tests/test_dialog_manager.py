@@ -284,6 +284,12 @@ def test_short_cantonese_confirmation_still_works() -> None:
     assert extract_info("冇问题").is_confirm is True
     assert extract_info("好的").is_confirm is True
     assert extract_info("对的对的，对的。对的对的。喂。").is_confirm is True
+    assert extract_info("嗯，对的对的 。喂。").is_confirm is True
+    assert extract_info("Yes, Nala.").is_confirm is True
+    assert extract_info("就是。").is_confirm is True
+    assert extract_info("就係。").is_confirm is True
+    assert extract_info("就系。").is_confirm is True
+    assert extract_info("It's.").is_confirm is False
 
 
 def test_expected_name_rejects_asr_sentence() -> None:
@@ -345,6 +351,15 @@ def test_expected_phone_recovers_digit_like_asr_substitution() -> None:
         expected_field="customer_phone",
     )
     assert out.customer_phone == "59266237"
+
+
+def test_expected_phone_strips_spoken_filler_and_spaces() -> None:
+    out = extract_info(
+        "呃，五幺二 六六二三七。",
+        expected_field="customer_phone",
+    )
+    assert out.customer_phone == "51266237"
+    assert out.phone_candidate == "51266237"
 
 
 def test_expected_phone_recovers_asr_substitution_after_phone_cue() -> None:

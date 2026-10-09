@@ -105,6 +105,10 @@ _PHONE_FUZZY_DIGIT_MAP = {
     "夠": "9",
 }
 _PHONE_SPOKEN_SEPARATORS = set(" \t\r\n，。,.!！?？、-—")
+_PHONE_LEADING_FILLER_RE = re.compile(
+    r"^\s*(?:(?:呃|额|嗯|哎|唉|喂|好)[\s，。,.!！?？、]*)+",
+    re.IGNORECASE,
+)
 
 _CONFIRM_FULL_UTTERANCES = {
     "啱",
@@ -147,6 +151,9 @@ _CONFIRM_FULL_UTTERANCES = {
     "可以啦",
     "就这样",
     "就這樣",
+    "就是",
+    "就係",
+    "就系",
     "就咁",
     "就咁啦",
     "就咁啊",
@@ -733,7 +740,7 @@ def _spoken_digits_to_phone(text: str, *, allow_fuzzy: bool = False) -> str:
     if not allow_fuzzy:
         return exact
 
-    fuzzy_text = text
+    fuzzy_text = _PHONE_LEADING_FILLER_RE.sub("", text)
     cue_match = _PHONE_CUE_RE.search(text)
     if cue_match:
         fuzzy_text = cue_match.group(1)
@@ -1067,8 +1074,12 @@ def _detect_intent(text: str, is_confirm: bool, is_deny: bool) -> str:
 def _is_confirm_utterance(text: str) -> bool:
     """Accept confirmation replies, but never treat copulas inside facts as yes."""
     compact = re.sub(r"[\s，。,.!！?？、]+", "", text.lower())
-    for filler in ("喂", "嗯", "啊", "呀", "哦"):
-        compact = compact.removesuffix(filler)
+    edge_fillers = ("nala", "喂", "嗯", "呃", "额", "啊", "呀", "哦", "啦", "喇")
+    previous = None
+    while compact and compact != previous:
+        previous = compact
+        for filler in edge_fillers:
+            compact = compact.removeprefix(filler).removesuffix(filler)
     if compact in _CONFIRM_FULL_UTTERANCES:
         return True
     # Natural acknowledgements such as “嗯，係啊” and “好，啱”.

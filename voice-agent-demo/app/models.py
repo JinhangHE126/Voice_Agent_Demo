@@ -14,6 +14,7 @@ class SessionState(str, Enum):
     THINKING = "thinking"
     SPEAKING = "speaking"
     BARGE_IN = "barge_in"
+    COMPLETED = "completed"
 
 
 class LatencyMetrics(BaseModel):

@@ -62,6 +62,7 @@
     .dot.on { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
     .dot.speak { background: var(--accent); }
     .dot.warn { background: var(--warn); }
+    .dot.ok { background: var(--ok); }
     .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
     .metric { border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
     .metric .label { color: var(--muted); font-size: 0.78rem; margin-bottom: 4px; }
@@ -200,11 +201,20 @@
       dot.className = "dot";
       if (state === "listening") dot.classList.add("on");
       else if (state === "speaking") dot.classList.add("speak");
+      else if (state === "completed") dot.classList.add("ok");
       else if (
         state === "thinking"
         || state === "endpointing"
         || state === "connecting_asr"
       ) dot.classList.add("warn");
+    }
+
+    function endListeningUi(reason) {
+      wantListen = false;
+      stopMic();
+      el("btnStart").disabled = false;
+      el("btnStop").disabled = true;
+      if (reason) log(reason);
     }
 
     function setMetric(id, ms, goodMax) {
@@ -511,6 +521,14 @@
         if (d.route) el("routePill").textContent = `route: ${d.route}`;
         if (d.draft) renderDraft(d.draft);
         log(`turn done route=${d.route || "—"} prompt=${d.prompt_id || "—"} saved=${!!d.saved}`);
+        if (d.saved) {
+          // Stop uploading mic audio immediately; completion prompt can still play.
+          wantListen = false;
+        }
+      } else if (t === "session.completed") {
+        if (d.draft) renderDraft(d.draft);
+        endListeningUi("session completed; mic stopped");
+        setState("completed");
       } else if (t === "error") {
         log("error: " + (d.message || ""));
       } else if (t !== "pong") {

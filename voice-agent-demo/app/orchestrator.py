@@ -103,6 +103,8 @@ class CallSession:
         self._asr_watchdog_tripped = False
         self._asr_ready_task: asyncio.Task | None = None
         self._asr_wait_prompt_task: asyncio.Task | None = None
+        self._pending_asr_reprompt = None
+        self._call_completed = False
 
         self.business_mode = (
             self.settings.business_mode.strip().lower() or "repair_order"
@@ -303,6 +305,7 @@ class CallSession:
     async def close(self) -> None:
         self._closed = True
         self._greeting_uninterruptible = False
+        self._pending_asr_reprompt = None
         if self._asr_ready_task and not self._asr_ready_task.done():
             self._asr_ready_task.cancel()
         self._asr_ready_task = None
@@ -368,6 +371,9 @@ class CallSession:
                 self.call_id,
                 self.settings.asr_wait_prompt_delay_ms,
             )
+            prepare_standby = getattr(self._asr, "prepare_standby", None)
+            if callable(prepare_standby):
+                prepare_standby()
             await self._emit_local_status_prompt("please_wait_asr")
         except asyncio.CancelledError:
             raise
@@ -435,6 +441,8 @@ class CallSession:
 
     async def on_pcm16(self, pcm: bytes) -> None:
         if self._closed or not pcm:
+            return
+        if self._call_completed or self.state == SessionState.COMPLETED:
             return
         if self._greeting_uninterruptible:
             return
@@ -570,6 +578,8 @@ class CallSession:
                 )
 
     async def force_end_utterance(self) -> None:
+        if self._call_completed or self.state == SessionState.COMPLETED:
+            return
         if self.state != SessionState.LISTENING:
             return
         self._mark_asr_speech_end()
@@ -623,6 +633,13 @@ class CallSession:
         self._speech_started_at = None
         self._asr_last_partial_at = None
         self._asr_watchdog_tripped = False
+        if self._call_completed or self.state == SessionState.COMPLETED:
+            logger.info(
+                "asr_final ignored after completion call=%s text=%r",
+                self.call_id,
+                text[:40] if text else "",
+            )
+            return
         if self._handling_final:
             return
         if not text:
@@ -633,23 +650,18 @@ class CallSession:
             self._barge_buffer.clear()
             if self.business_mode == "repair_order":
                 plan = self.dialog.next_prompt(self.draft)
-                self.turn_id += 1
-                self.generation_id += 1
-                gen = self.generation_id
-                self._first_audio_marked = False
-                self._awaiting_playback_done = False
-                self.state = SessionState.THINKING
-                await self._emit("state", {"state": self.state.value})
-                self._cancel = asyncio.Event()
-                self._reply_task = asyncio.create_task(
-                    self._speak_text(
-                        plan.text,
-                        generation_id=gen,
-                        route="asr_reprompt",
-                        prompt_id=plan.prompt_id,
-                        prefer_local=not plan.dynamic,
+                if self._asr is not None and not self._asr_is_ready():
+                    self._pending_asr_reprompt = plan
+                    self.state = SessionState.CONNECTING_ASR
+                    await self._emit("state", {"state": self.state.value})
+                    await self._emit(
+                        "asr.connecting",
+                        {"message": "语音识别连接中，请稍候"},
                     )
-                )
+                    await self._emit_local_status_prompt("connecting_asr")
+                    self._start_asr_ready_wait()
+                    return
+                await self._start_asr_reprompt(plan)
                 return
             self.state = SessionState.LISTENING
             await self._emit("state", {"state": self.state.value})
@@ -699,6 +711,26 @@ class CallSession:
             )
         finally:
             self._handling_final = False
+
+    async def _start_asr_reprompt(self, plan) -> None:
+        self._pending_asr_reprompt = None
+        self.turn_id += 1
+        self.generation_id += 1
+        gen = self.generation_id
+        self._first_audio_marked = False
+        self._awaiting_playback_done = False
+        self.state = SessionState.THINKING
+        await self._emit("state", {"state": self.state.value})
+        self._cancel = asyncio.Event()
+        self._reply_task = asyncio.create_task(
+            self._speak_text(
+                plan.text,
+                generation_id=gen,
+                route="asr_reprompt",
+                prompt_id=plan.prompt_id,
+                prefer_local=not plan.dynamic,
+            )
+        )
 
     async def _mark_first_audio(self, *, generation_id: int) -> None:
         if generation_id != self.generation_id or self._first_audio_marked:
@@ -933,8 +965,11 @@ class CallSession:
                 self._greeting_uninterruptible = False
             if emit_turn_done and generation_id == self.generation_id:
                 if not self._awaiting_playback_done:
-                    self._finish_listening()
-                    await self._emit("state", {"state": self.state.value})
+                    if self._call_completed or saved:
+                        await self._enter_completed()
+                    else:
+                        self._finish_listening()
+                        await self._emit("state", {"state": self.state.value})
 
     async def _run_reply(self, user_text: str, *, generation_id: int) -> None:
         if self.business_mode == "repair_order":
@@ -1009,6 +1044,10 @@ class CallSession:
                 self.draft.repair_confirmed,
                 self.draft.address_confirmed,
             )
+            if turn.saved:
+                # Stop accepting mic/ASR as soon as the order is persisted,
+                # while still playing the completion prompt.
+                self._call_completed = True
             await self._speak_text(
                 turn.plan.text,
                 generation_id=generation_id,
@@ -1118,6 +1157,9 @@ class CallSession:
                 # with jitter. Ignore premature completion and wait.
                 return
         self._awaiting_playback_done = False
+        if self._call_completed:
+            await self._enter_completed()
+            return
         if self._startup_phase in {"greeting", "ask_name"}:
             if self._asr_is_ready():
                 if self._startup_phase == "greeting":
@@ -1195,6 +1237,11 @@ class CallSession:
                 await self._speak_startup_ask_name()
                 return
             self._greeting_uninterruptible = False
+            pending_reprompt = self._pending_asr_reprompt
+            if pending_reprompt is not None:
+                await self._emit("asr.ready", {})
+                await self._start_asr_reprompt(pending_reprompt)
+                return
             self._finish_listening()
             await self._emit("asr.ready", {})
             await self._emit("state", {"state": self.state.value})
@@ -1205,6 +1252,9 @@ class CallSession:
                 self._asr_ready_task = None
 
     def _finish_listening(self) -> None:
+        if self._call_completed:
+            self.state = SessionState.COMPLETED
+            return
         self.state = SessionState.LISTENING
         self.vad.reset()
         self._barge_buffer.clear()
@@ -1215,6 +1265,44 @@ class CallSession:
         self._cancel_asr_watchdog()
         self._turn_clock = None
         self._speaking_started_at = None
+
+    async def _enter_completed(self) -> None:
+        self._call_completed = True
+        self._greeting_uninterruptible = False
+        self._pending_asr_reprompt = None
+        self._awaiting_playback_done = False
+        self._cancel_asr_wait_prompt()
+        self._cancel_asr_watchdog()
+        self.vad.reset()
+        self._barge_buffer.clear()
+        self._barge_started_at = None
+        self._speech_started_at = None
+        self._asr_last_partial_at = None
+        self._turn_clock = None
+        self._speaking_started_at = None
+        if self.state == SessionState.COMPLETED:
+            return
+        self.state = SessionState.COMPLETED
+        logger.info("session_completed call=%s", self.call_id)
+        await self._emit(
+            "session.completed",
+            {
+                "draft": {
+                    "customer_name": self.draft.customer_name,
+                    "customer_phone": self.draft.customer_phone,
+                    "customer_address": self.draft.customer_address,
+                    "repair_description": self.draft.repair_description,
+                    "state": self.draft.state.value,
+                }
+            },
+        )
+        await self._emit("state", {"state": self.state.value})
+        if self._asr:
+            try:
+                await self._asr.close()
+            except Exception:
+                pass
+            self._asr = None
 
     async def _handle_barge_in(
         self,

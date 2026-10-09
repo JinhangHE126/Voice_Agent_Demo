@@ -334,6 +334,46 @@ async def test_empty_asr_final_reprompts_current_repair_field() -> None:
 
 
 @pytest.mark.asyncio
+async def test_saved_order_stops_listening_and_ignores_later_speech() -> None:
+    events: list[ServerEvent] = []
+
+    async def emit(ev: ServerEvent) -> None:
+        events.append(ev)
+
+    session = CallSession(
+        emit=emit,
+        settings=Settings(
+            agent_mode="mock",
+            business_mode="repair_order",
+            input_denoise_enabled=False,
+            playback_done_grace_ms=0,
+        ),
+        call_id="order-completed",
+    )
+    session.state = SessionState.SPEAKING
+    session.generation_id = 3
+    session._awaiting_playback_done = True
+    session._call_completed = True
+    session._last_tts_audio_at = 0.0
+
+    await session.on_playback_done(3)
+    assert session.state == SessionState.COMPLETED
+    assert any(event.type == "session.completed" for event in events)
+
+    event_count = len(events)
+    await session.on_pcm16(b"\x00\x20" * 320)
+    assert len(events) == event_count
+
+    await session._on_asr_final("好，拜拜。", lang="zh")
+    assert not any(
+        event.type == "asr.final" and event.data.get("text") == "好，拜拜。"
+        for event in events
+    )
+    assert session.state == SessionState.COMPLETED
+    await session.close()
+
+
+@pytest.mark.asyncio
 async def test_asr_watchdog_forces_end_when_no_partial_progress() -> None:
     events: list[ServerEvent] = []
 
@@ -382,6 +422,93 @@ async def test_asr_watchdog_forces_end_when_no_partial_progress() -> None:
     assert any(e.type == "speech.ended" and e.data.get("manual") for e in events)
     assert session.state.value == "endpointing"
 
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_wait_prompt_prepares_asr_standby() -> None:
+    async def emit(_ev: ServerEvent) -> None:
+        return
+
+    settings = Settings(
+        agent_mode="mock",
+        business_mode="repair_order",
+        asr_wait_prompt_delay_ms=0,
+        input_denoise_enabled=False,
+    )
+    session = CallSession(
+        emit=emit,
+        settings=settings,
+        call_id="standby-warmup",
+    )
+
+    class FakeASR:
+        def __init__(self) -> None:
+            self.prepared = False
+
+        def prepare_standby(self) -> None:
+            self.prepared = True
+
+    fake_asr = FakeASR()
+    session._asr = fake_asr
+    session.state = SessionState.ENDPOINTING
+
+    await session._run_asr_wait_prompt(session.generation_id)
+
+    assert fake_asr.prepared is True
+
+
+@pytest.mark.asyncio
+async def test_empty_final_waits_for_asr_before_reprompt() -> None:
+    events: list[ServerEvent] = []
+
+    async def emit(ev: ServerEvent) -> None:
+        events.append(ev)
+
+    settings = Settings(
+        agent_mode="mock",
+        business_mode="repair_order",
+        input_denoise_enabled=False,
+    )
+    session = CallSession(
+        emit=emit,
+        settings=settings,
+        call_id="reprompt-after-recovery",
+    )
+    session.dialog.greeting(session.draft)
+
+    class RecoveringASR:
+        def __init__(self) -> None:
+            self.is_ready = False
+
+        async def wait_until_ready(self, _timeout_s: float) -> bool:
+            await asyncio.sleep(0)
+            self.is_ready = True
+            return True
+
+        async def close(self) -> None:
+            return
+
+    session._asr = RecoveringASR()
+    await session._on_asr_final("", lang="yue")
+
+    for _ in range(50):
+        if any(
+            event.type == "prompt.audio"
+            and event.data.get("prompt_id") == "ask_name"
+            for event in events
+        ):
+            break
+        await asyncio.sleep(0.01)
+
+    assert any(event.type == "asr.connecting" for event in events)
+    assert any(event.type == "asr.ready" for event in events)
+    assert any(
+        event.type == "prompt.audio"
+        and event.data.get("prompt_id") == "ask_name"
+        for event in events
+    )
+    assert session._pending_asr_reprompt is None
     await session.close()
 
 
