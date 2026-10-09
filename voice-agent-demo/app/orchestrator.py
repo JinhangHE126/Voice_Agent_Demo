@@ -39,7 +39,7 @@ def _b64(pcm: bytes) -> str:
 
 class CallSession:
     """
-    Qwen ASR → repair-order DialogManager (or graded LLM) → MiniMax TTS.
+    Qwen ASR → repair-order DialogManager (or graded LLM) → MiniMax TTS. 
 
     Target: EoU → first playable audio ≤ 1000ms (cloud path; mock proves wiring).
     """
@@ -1019,12 +1019,16 @@ class CallSession:
             filler_task: asyncio.Task | None = None
             if filler_id:
                 # Start filler immediately while LLM extraction runs.
+                # Do not mark first-audio / awaiting playback for the filler:
+                # it shares generation_id with the real reply, and an early
+                # playback.done would flip LISTENING↔SPEAKING while MiniMax
+                # is still streaming the confirmation sentence.
                 filler_task = asyncio.create_task(
                     self._play_prompt_id(
                         filler_id,
                         generation_id=generation_id,
                         route="repair_filler",
-                        mark_latency=True,
+                        mark_latency=False,
                     )
                 )
                 await self._emit(

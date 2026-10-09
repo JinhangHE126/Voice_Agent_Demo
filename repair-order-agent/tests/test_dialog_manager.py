@@ -350,6 +350,27 @@ def test_extract_address_from_phrase() -> None:
     assert out.intent == "provide_info"
 
 
+def test_address_strips_spoken_residence_prefix() -> None:
+    out = extract_info(
+        "哎好，我住九龙半岛油尖旺区佐敦文苑街文苑楼九座九幺幺D室。",
+        expected_field="customer_address",
+    )
+    assert out.customer_address is not None
+    assert not out.customer_address.startswith("哎")
+    assert "我住" not in out.customer_address
+    assert "九龙半岛油尖旺区佐敦文苑街文苑楼" in out.customer_address
+
+
+def test_repair_strips_leading_hao_filler() -> None:
+    out = extract_info(
+        "好，我电脑主机坏了，需要去清洗",
+        expected_field="repair_description",
+    )
+    assert out.repair_description is not None
+    assert not out.repair_description.startswith("好")
+    assert "电脑主机坏了" in out.repair_description
+
+
 def test_copula_in_information_is_not_confirmation() -> None:
     assert extract_info("电话係91234567").is_confirm is False
     assert extract_info("问题係冷气唔冻").is_confirm is False

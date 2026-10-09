@@ -407,8 +407,17 @@ _REPAIR_TIME_RE = re.compile(
     r"(?:早上|朝早|上午|中午|下午|晚上|夜晚)?"
 )
 _REPAIR_LEADING_FILLER_RE = re.compile(
-    r"^(?:(?:你好|您好|喂|哎|唉|好的|好嘅|嗯|嗱)[呀啊哦喔]*"
+    r"^(?:(?:你好|您好|喂|哎|唉|好的|好嘅|好|嗯|嗱)[呀啊哦喔]*"
     r"[\s，。,.!！?？]*)+"
+)
+_ADDRESS_LEADING_FILLER_RE = re.compile(
+    r"^(?:(?:你好|您好|喂|哎|唉|好的|好嘅|好|嗯|嗱)[呀啊哦喔]*"
+    r"[\s，。,.!！?？]*)+"
+)
+_ADDRESS_PREFIX_RE = re.compile(
+    r"^(?:我的?)?(?:维修|維修)?(?:地址|住址|地点|地點)"
+    r"(?:係|是|在|为|為)?\s*[:：]?\s*"
+    r"|^(?:我)?(?:住在|住喺|住)\s*"
 )
 
 _SOCIAL_ONLY_TOKENS = (
@@ -472,7 +481,9 @@ _LLM_EXTRACTOR_PROMPT = (
     "2. 禁止猜测、补写、改写地址中的数字/楼层/房号。\n"
     "3. repair_description 必须保留原文中每一个独立故障、原因、危险现象和当前状态；"
     "不得为了简短而遗漏任何一项，只去掉寒暄与“帮我修一下”等脚手架。\n"
-    "4. customer_address 只保留地址本身，去掉“地址是/住址在”等前缀。\n"
+    "4. customer_address 只保留地址本身，必须去掉寒暄与口语脚手架："
+    "例如“哎/好/嗯/喂”、“我住/我住在”、“地址是/住址在/我的地址是”等；"
+    "不要把整句用户原话原样写入地址。\n"
     "5. customer_address 尽量整理成香港地址顺序："
     "地域（香港/九龙/新界）→ 地区 → 街道及门牌 → 大厦 → 楼层及室号；"
     "只可重排与去口语前缀，禁止编造缺失的地域/地区/门牌/楼层/室号。\n"
@@ -1051,6 +1062,19 @@ def _detect_lang(text: str) -> tuple[str, float]:
     return "cmn", 0.4
 
 
+def _clean_address_text(text: str | None) -> str | None:
+    """Keep only the address body; drop greetings and “我住/地址是” scaffolds."""
+    candidate = (text or "").strip(" ，。,.!！?？")
+    if not candidate:
+        return None
+    candidate = _ADDRESS_LEADING_FILLER_RE.sub("", candidate).strip(" ，。,.!！?？")
+    previous = None
+    while candidate and candidate != previous:
+        previous = candidate
+        candidate = _ADDRESS_PREFIX_RE.sub("", candidate).strip(" ，。,.!！?？")
+    return candidate or None
+
+
 def _extract_address(text: str) -> str | None:
     stripped = text.strip(" ，。,.!！?？")
     if not stripped:
@@ -1060,19 +1084,25 @@ def _extract_address(text: str) -> str | None:
         stripped,
     )
     if m:
-        return m.group(1).strip()
+        return _clean_address_text(m.group(1))
     if any(marker.lower() in stripped.lower() for marker in _ADDRESS_MARKERS):
         # Avoid treating pure repair sentences as address.
         if any(marker in stripped for marker in _REPAIR_MARKERS) and not any(
             x in stripped for x in ("地址", "住址", "街", "路", "大厦", "大廈", "号", "號")
         ):
             return None
-        return stripped
+        return _clean_address_text(stripped)
+    # “哎好，我住九龙…” may not contain an explicit 地址 marker.
+    cleaned = _clean_address_text(stripped)
+    if cleaned and cleaned != stripped and any(
+        marker.lower() in cleaned.lower() for marker in _ADDRESS_MARKERS
+    ):
+        return cleaned
     return None
 
 
 def _address_valid(text: str | None) -> bool:
-    t = (text or "").strip(" ，。,.!！?？")
+    t = _clean_address_text(text) or ""
     if not t:
         return False
     if _is_social_only(t):
@@ -1350,11 +1380,13 @@ def _apply_expected_field_fallback(
     elif expected_field == "customer_phone" and not result.customer_phone:
         result.customer_phone = _normalize_phone(stripped, allow_fuzzy=True)
     elif expected_field == "customer_address" and not result.customer_address:
-        if _address_valid(stripped):
-            result.customer_address = stripped
+        cleaned = _clean_address_text(stripped)
+        if _address_valid(cleaned):
+            result.customer_address = cleaned
     elif expected_field == "repair_description" and not result.repair_description:
-        if 2 <= len(stripped) <= 80:
-            result.repair_description = stripped
+        cleaned = _REPAIR_LEADING_FILLER_RE.sub("", stripped).strip(" ，。,.!！?？")
+        if 2 <= len(cleaned) <= 80 and _repair_valid(cleaned):
+            result.repair_description = cleaned
     return result
 
 
@@ -1402,9 +1434,11 @@ def _apply_llm_obj(
     )
 
     if address:
-        candidate = str(address).strip()
-        if _address_valid(candidate) and _grounded_in_source(
-            candidate, address_evidence, normalized
+        candidate = _clean_address_text(str(address))
+        if (
+            candidate
+            and _address_valid(candidate)
+            and _grounded_in_source(candidate, address_evidence, normalized)
         ):
             result.customer_address = candidate
             snippets = _evidence_snippets(address_evidence)
@@ -1412,6 +1446,9 @@ def _apply_llm_obj(
 
     if repair:
         candidate = str(repair).strip()
+        candidate = _REPAIR_LEADING_FILLER_RE.sub("", candidate).strip(
+            " ，。,.!！?？"
+        )
         if candidate and _grounded_in_source(candidate, repair_evidence, normalized):
             result.repair_description = candidate
             snippets = _evidence_snippets(repair_evidence)
@@ -1470,8 +1507,10 @@ def _finalize_extract(
 
     if result.customer_phone and not _is_valid_phone_digits(result.customer_phone):
         result.customer_phone = None
-    if result.customer_address and not _address_valid(result.customer_address):
-        result.customer_address = None
+    if result.customer_address:
+        result.customer_address = _clean_address_text(result.customer_address)
+        if not _address_valid(result.customer_address):
+            result.customer_address = None
     if result.repair_description and not _repair_valid(result.repair_description):
         result.repair_description = None
     elif result.repair_description:
