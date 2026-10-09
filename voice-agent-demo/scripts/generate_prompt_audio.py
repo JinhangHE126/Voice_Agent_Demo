@@ -27,7 +27,9 @@ PROMPTS: dict[str, str] = {
     "order_saved": "已经帮你登记咗维修订单，我哋会尽快安排同事联络你。",
     "invalid_phone_length": "你啱啱讲嘅电话号码位数唔啱，请逐个数字再讲一次。",
     "ask_correct_field": "请问边项资料唔啱？你可以直接讲正确嘅资料。",
-    "please_wait_asr": "语音识别连接紧，请稍等。",
+    "please_wait_asr": "收到，等我一下。",
+    "connecting_asr": "正在帮你接通，请稍等一下。",
+    "asr_unavailable": "唔好意思，暂时未能接通，请稍后再试。",
 }
 
 

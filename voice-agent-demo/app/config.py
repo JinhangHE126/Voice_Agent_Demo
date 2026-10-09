@@ -38,6 +38,14 @@ class Settings(BaseSettings):
     dashscope_asr_ws_url: str = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
     dashscope_asr_silence_ms: int = 300
     dashscope_asr_final_timeout_ms: int = 2500
+    # Maximum customer-facing silence while one utterance is finalized.
+    dashscope_asr_hard_timeout_ms: int = 5000
+    # Play a short local acknowledgement if ASR has not finalized by then.
+    asr_wait_prompt_delay_ms: int = 900
+    # Very short turns with no ASR progress are reprompted instead of replayed.
+    asr_short_utterance_ms: int = 500
+    # Do not leave a caller waiting indefinitely during initial ASR setup.
+    asr_startup_timeout_ms: int = 15000
     asr_no_progress_timeout_ms: int = 0
 
     minimax_api_key: str = ""

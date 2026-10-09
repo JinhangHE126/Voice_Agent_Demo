@@ -96,11 +96,13 @@ class CallSession:
         self._barge_started_at: float | None = None
         self._last_tts_audio_at: float | None = None
         self._greeting_uninterruptible = False
+        self._startup_phase: str | None = None
         self._speech_started_at: float | None = None
         self._asr_last_partial_at: float | None = None
         self._asr_watchdog_task: asyncio.Task | None = None
         self._asr_watchdog_tripped = False
         self._asr_ready_task: asyncio.Task | None = None
+        self._asr_wait_prompt_task: asyncio.Task | None = None
 
         self.business_mode = (
             self.settings.business_mode.strip().lower() or "repair_order"
@@ -232,6 +234,7 @@ class CallSession:
             # From session start until greeting playback completes, ignore
             # microphone input so callers cannot preempt the first line.
             self._greeting_uninterruptible = True
+            self._startup_phase = "greeting"
             asyncio.create_task(self._speak_greeting())
 
     async def _speak_greeting(self) -> None:
@@ -268,7 +271,31 @@ class CallSession:
                 plan.text,
                 generation_id=gen,
                 route="repair_greeting",
-                prompt_id="greeting+ask_name",
+                prompt_id=plan.prompt_id,
+            )
+        )
+
+    async def _speak_startup_ask_name(self) -> None:
+        if self._closed:
+            return
+        plan = self.dialog.next_prompt(self.draft)
+        self._startup_phase = "ask_name"
+        self.turn_id += 1
+        self.generation_id += 1
+        gen = self.generation_id
+        self._turn_clock = time.perf_counter()
+        self._latency = LatencyMetrics(eou_ms=0.0)
+        self._first_audio_marked = False
+        self._awaiting_playback_done = False
+        self._cancel = asyncio.Event()
+        self.state = SessionState.THINKING
+        await self._emit("state", {"state": self.state.value})
+        self._reply_task = asyncio.create_task(
+            self._speak_text(
+                plan.text,
+                generation_id=gen,
+                route="repair_ask_name",
+                prompt_id=plan.prompt_id,
             )
         )
 
@@ -278,6 +305,7 @@ class CallSession:
         if self._asr_ready_task and not self._asr_ready_task.done():
             self._asr_ready_task.cancel()
         self._asr_ready_task = None
+        self._cancel_asr_wait_prompt()
         self._cancel_asr_watchdog()
         await self._cancel_generation()
         if self._asr:
@@ -287,6 +315,64 @@ class CallSession:
         if self._asr_watchdog_task and not self._asr_watchdog_task.done():
             self._asr_watchdog_task.cancel()
         self._asr_watchdog_task = None
+
+    def _cancel_asr_wait_prompt(self) -> None:
+        if self._asr_wait_prompt_task and not self._asr_wait_prompt_task.done():
+            self._asr_wait_prompt_task.cancel()
+        self._asr_wait_prompt_task = None
+
+    def _start_asr_wait_prompt(self) -> None:
+        self._cancel_asr_wait_prompt()
+        if self.business_mode != "repair_order":
+            return
+        generation_id = self.generation_id
+        self._asr_wait_prompt_task = asyncio.create_task(
+            self._run_asr_wait_prompt(generation_id)
+        )
+
+    async def _emit_local_status_prompt(self, prompt_id: str) -> bool:
+        pcm = self.prompts.load_pcm16(prompt_id, lang=self._prompt_lang())
+        if not pcm:
+            return False
+        await self._emit(
+            "prompt.audio",
+            {
+                "prompt_id": prompt_id,
+                "source": "local_wav",
+                "bytes": len(pcm),
+            },
+        )
+        await self._emit(
+            "tts.audio",
+            {
+                "pcm16_b64": _b64(pcm),
+                "sample_rate": self.settings.sample_rate,
+            },
+        )
+        return True
+
+    async def _run_asr_wait_prompt(self, generation_id: int) -> None:
+        try:
+            await asyncio.sleep(
+                max(0, int(self.settings.asr_wait_prompt_delay_ms)) / 1000.0
+            )
+            if (
+                self._closed
+                or generation_id != self.generation_id
+                or self.state != SessionState.ENDPOINTING
+            ):
+                return
+            logger.info(
+                "asr_wait_prompt call=%s elapsed_ms=%s",
+                self.call_id,
+                self.settings.asr_wait_prompt_delay_ms,
+            )
+            await self._emit_local_status_prompt("please_wait_asr")
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._asr_wait_prompt_task is asyncio.current_task():
+                self._asr_wait_prompt_task = None
 
     def _mark_asr_speech_start(self) -> None:
         marker = getattr(self._asr, "mark_speech_start", None)
@@ -470,7 +556,17 @@ class CallSession:
             )
             await self._emit("state", {"state": self.state.value})
             if self._asr:
-                asyncio.create_task(self._asr.end_utterance())
+                speech_ms = int(ev.get("speech_ms") or 0)
+                self._start_asr_wait_prompt()
+                asyncio.create_task(
+                    self._asr.end_utterance(
+                        fast_fail=(
+                            speech_ms > 0
+                            and speech_ms
+                            <= int(self.settings.asr_short_utterance_ms)
+                        )
+                    )
+                )
 
     async def force_end_utterance(self) -> None:
         if self.state != SessionState.LISTENING:
@@ -483,7 +579,8 @@ class CallSession:
         await self._emit("speech.ended", {"manual": True})
         await self._emit("state", {"state": self.state.value})
         if self._asr:
-            asyncio.create_task(self._asr.end_utterance())
+            self._start_asr_wait_prompt()
+            asyncio.create_task(self._asr.end_utterance(fast_fail=False))
 
     async def _reset_asr(self) -> None:
         if self._asr:
@@ -506,6 +603,7 @@ class CallSession:
                 ws_url=self.settings.dashscope_asr_ws_url,
                 silence_ms=self.settings.dashscope_asr_silence_ms,
                 final_timeout_ms=self.settings.dashscope_asr_final_timeout_ms,
+                hard_timeout_ms=self.settings.dashscope_asr_hard_timeout_ms,
                 on_partial=on_partial,
                 on_final=on_final,
             )
@@ -519,6 +617,7 @@ class CallSession:
 
     async def _on_asr_final(self, text: str, *, lang: str = "yue") -> None:
         text = (text or "").strip()
+        self._cancel_asr_wait_prompt()
         self._cancel_asr_watchdog()
         self._speech_started_at = None
         self._asr_last_partial_at = None
@@ -527,14 +626,34 @@ class CallSession:
             return
         if not text:
             logger.info("asr_final empty call=%s lang=%s", self.call_id, lang)
-            self.state = SessionState.LISTENING
             await self._emit("asr.final", {"text": "", "empty": True})
-            await self._emit("state", {"state": self.state.value})
             self.vad.reset()
             self._partial_text = ""
+            self._barge_buffer.clear()
+            if self.business_mode == "repair_order":
+                plan = self.dialog.next_prompt(self.draft)
+                self.turn_id += 1
+                self.generation_id += 1
+                gen = self.generation_id
+                self._first_audio_marked = False
+                self._awaiting_playback_done = False
+                self.state = SessionState.THINKING
+                await self._emit("state", {"state": self.state.value})
+                self._cancel = asyncio.Event()
+                self._reply_task = asyncio.create_task(
+                    self._speak_text(
+                        plan.text,
+                        generation_id=gen,
+                        route="asr_reprompt",
+                        prompt_id=plan.prompt_id,
+                        prefer_local=not plan.dynamic,
+                    )
+                )
+                return
+            self.state = SessionState.LISTENING
+            await self._emit("state", {"state": self.state.value})
             self._turn_clock = None
             self._latency = LatencyMetrics()
-            self._barge_buffer.clear()
             return
 
         if self.state in {SessionState.THINKING, SessionState.SPEAKING}:
@@ -994,7 +1113,27 @@ class CallSession:
                 # with jitter. Ignore premature completion and wait.
                 return
         self._awaiting_playback_done = False
-        if self._greeting_uninterruptible and not self._asr_is_ready():
+        if self._startup_phase in {"greeting", "ask_name"}:
+            if self._asr_is_ready():
+                if self._startup_phase == "greeting":
+                    await self._speak_startup_ask_name()
+                    return
+                self._startup_phase = None
+                self._greeting_uninterruptible = False
+                self._finish_listening()
+                await self._emit("state", {"state": self.state.value})
+                return
+            self._startup_phase = "waiting_asr"
+            self.state = SessionState.CONNECTING_ASR
+            await self._emit("state", {"state": self.state.value})
+            await self._emit(
+                "asr.connecting",
+                {"message": "正在为你接通，请稍候"},
+            )
+            await self._emit_local_status_prompt("connecting_asr")
+            self._start_asr_ready_wait()
+            return
+        if not self._asr_is_ready():
             self.state = SessionState.CONNECTING_ASR
             await self._emit("state", {"state": self.state.value})
             await self._emit(
@@ -1016,19 +1155,39 @@ class CallSession:
         self._asr_ready_task = asyncio.create_task(self._wait_for_asr_ready())
 
     async def _wait_for_asr_ready(self) -> None:
+        startup_wait = self._startup_phase == "waiting_asr"
+        deadline = (
+            time.monotonic()
+            + max(0, int(self.settings.asr_startup_timeout_ms)) / 1000.0
+            if startup_wait
+            else None
+        )
         try:
             while not self._closed and not self._asr_is_ready():
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                else:
+                    remaining = 10.0
                 waiter = getattr(self._asr, "wait_until_ready", None)
                 if not callable(waiter):
                     break
-                await waiter(10.0)
+                await waiter(min(10.0, remaining))
             if self._closed:
                 return
             if not self._asr_is_ready():
+                if startup_wait:
+                    self._startup_phase = "failed"
+                    await self._emit_local_status_prompt("asr_unavailable")
                 await self._emit(
                     "error",
-                    {"message": "语音识别暂时无法连接，请稍后重试"},
+                    {"message": "暂时未能接通语音识别，请稍后重新开始"},
                 )
+                return
+            if startup_wait:
+                await self._emit("asr.ready", {})
+                await self._speak_startup_ask_name()
                 return
             self._greeting_uninterruptible = False
             self._finish_listening()
