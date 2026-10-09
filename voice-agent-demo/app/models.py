@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 class SessionState(str, Enum):
     IDLE = "idle"
+    CONNECTING_ASR = "connecting_asr"
     LISTENING = "listening"
     ENDPOINTING = "endpointing"
     THINKING = "thinking"

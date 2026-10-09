@@ -100,6 +100,7 @@ class CallSession:
         self._asr_last_partial_at: float | None = None
         self._asr_watchdog_task: asyncio.Task | None = None
         self._asr_watchdog_tripped = False
+        self._asr_ready_task: asyncio.Task | None = None
 
         self.business_mode = (
             self.settings.business_mode.strip().lower() or "repair_order"
@@ -256,6 +257,7 @@ class CallSession:
                 "customer_phone": self.draft.customer_phone,
                 "customer_address": self.draft.customer_address,
                 "repair_description": self.draft.repair_description,
+                "repair_confirmed": self.draft.repair_confirmed,
                 "state": self.draft.state.value,
                 "awaiting_field": self.draft.awaiting_field,
                 "session_language": self.draft.session_language,
@@ -266,13 +268,16 @@ class CallSession:
                 plan.text,
                 generation_id=gen,
                 route="repair_greeting",
-                prompt_id=plan.prompt_id,
+                prompt_id="greeting+ask_name",
             )
         )
 
     async def close(self) -> None:
         self._closed = True
         self._greeting_uninterruptible = False
+        if self._asr_ready_task and not self._asr_ready_task.done():
+            self._asr_ready_task.cancel()
+        self._asr_ready_task = None
         self._cancel_asr_watchdog()
         await self._cancel_generation()
         if self._asr:
@@ -606,32 +611,27 @@ class CallSession:
         generation_id: int,
         cancel_event: asyncio.Event | None = None,
         on_first_audio=None,
-        frame_ms: int = 40,
     ) -> None:
         if not pcm:
             return
-        first = True
-        frame = int(self.settings.sample_rate * (frame_ms / 1000.0)) * 2
-        for i in range(0, len(pcm), frame):
-            if cancel_event and cancel_event.is_set():
-                return
-            if generation_id != self.generation_id:
-                return
-            chunk = pcm[i : i + frame]
-            if first:
-                first = False
-                if on_first_audio:
-                    await on_first_audio()
-            await self._emit(
-                "tts.audio",
-                {
-                    "pcm16_b64": _b64(chunk),
-                    "sample_rate": self.settings.sample_rate,
-                },
-            )
-            self._last_tts_audio_at = time.perf_counter()
-            # Pace roughly realtime so barge-in remains usable.
-            await asyncio.sleep(frame_ms / 1000.0)
+        if cancel_event and cancel_event.is_set():
+            return
+        if generation_id != self.generation_id:
+            return
+        if on_first_audio:
+            await on_first_audio()
+        # Local WAV is already fully available. Sending it as one buffer avoids
+        # browser underruns caused by pacing tiny chunks at the exact playback
+        # rate. Barge-in remains available because the browser tracks and can
+        # stop the scheduled AudioBufferSourceNode.
+        await self._emit(
+            "tts.audio",
+            {
+                "pcm16_b64": _b64(pcm),
+                "sample_rate": self.settings.sample_rate,
+            },
+        )
+        self._last_tts_audio_at = time.perf_counter()
 
     async def _play_prompt_id(
         self,
@@ -641,9 +641,14 @@ class CallSession:
         route: str,
         mark_latency: bool = True,
     ) -> bool:
-        pcm = self.prompts.load_pcm16(prompt_id, lang=self._prompt_lang())
-        if not pcm:
+        prompt_ids = prompt_id.split("+")
+        pcm_parts = [
+            self.prompts.load_pcm16(item, lang=self._prompt_lang())
+            for item in prompt_ids
+        ]
+        if not pcm_parts or any(part is None for part in pcm_parts):
             return False
+        pcm = b"".join(part for part in pcm_parts if part)
 
         async def on_first_audio() -> None:
             if mark_latency:
@@ -784,6 +789,7 @@ class CallSession:
                             "customer_phone": self.draft.customer_phone,
                             "customer_address": self.draft.customer_address,
                             "repair_description": self.draft.repair_description,
+                            "repair_confirmed": self.draft.repair_confirmed,
                             "state": self.draft.state.value,
                             "awaiting_field": self.draft.awaiting_field,
                             "session_language": self.draft.session_language,
@@ -854,6 +860,7 @@ class CallSession:
                     "customer_phone": self.draft.customer_phone,
                     "customer_address": self.draft.customer_address,
                     "repair_description": self.draft.repair_description,
+                    "repair_confirmed": self.draft.repair_confirmed,
                     "state": self.draft.state.value,
                     "awaiting_field": self.draft.awaiting_field,
                     "session_language": self.draft.session_language,
@@ -866,11 +873,17 @@ class CallSession:
                 },
             )
             logger.info(
-                "draft_update call=%s updated_fields=%s awaiting=%s state=%s",
+                "draft_update call=%s updated_fields=%s awaiting=%s state=%s "
+                "name=%r phone=%r address=%r repair=%r repair_confirmed=%s",
                 self.call_id,
                 turn.updated_fields or [],
                 self.draft.awaiting_field,
                 self.draft.state.value,
+                self.draft.customer_name,
+                self.draft.customer_phone,
+                self.draft.customer_address,
+                self.draft.repair_description,
+                self.draft.repair_confirmed,
             )
             await self._speak_text(
                 turn.plan.text,
@@ -981,9 +994,51 @@ class CallSession:
                 # with jitter. Ignore premature completion and wait.
                 return
         self._awaiting_playback_done = False
+        if self._greeting_uninterruptible and not self._asr_is_ready():
+            self.state = SessionState.CONNECTING_ASR
+            await self._emit("state", {"state": self.state.value})
+            await self._emit(
+                "asr.connecting",
+                {"message": "语音识别连接中，请稍候"},
+            )
+            self._start_asr_ready_wait()
+            return
         self._greeting_uninterruptible = False
         self._finish_listening()
         await self._emit("state", {"state": self.state.value})
+
+    def _asr_is_ready(self) -> bool:
+        return bool(self._asr and getattr(self._asr, "is_ready", True))
+
+    def _start_asr_ready_wait(self) -> None:
+        if self._asr_ready_task and not self._asr_ready_task.done():
+            return
+        self._asr_ready_task = asyncio.create_task(self._wait_for_asr_ready())
+
+    async def _wait_for_asr_ready(self) -> None:
+        try:
+            while not self._closed and not self._asr_is_ready():
+                waiter = getattr(self._asr, "wait_until_ready", None)
+                if not callable(waiter):
+                    break
+                await waiter(10.0)
+            if self._closed:
+                return
+            if not self._asr_is_ready():
+                await self._emit(
+                    "error",
+                    {"message": "语音识别暂时无法连接，请稍后重试"},
+                )
+                return
+            self._greeting_uninterruptible = False
+            self._finish_listening()
+            await self._emit("asr.ready", {})
+            await self._emit("state", {"state": self.state.value})
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._asr_ready_task is asyncio.current_task():
+                self._asr_ready_task = None
 
     def _finish_listening(self) -> None:
         self.state = SessionState.LISTENING

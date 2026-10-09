@@ -200,7 +200,11 @@
       dot.className = "dot";
       if (state === "listening") dot.classList.add("on");
       else if (state === "speaking") dot.classList.add("speak");
-      else if (state === "thinking" || state === "endpointing") dot.classList.add("warn");
+      else if (
+        state === "thinking"
+        || state === "endpointing"
+        || state === "connecting_asr"
+      ) dot.classList.add("warn");
     }
 
     function setMetric(id, ms, goodMax) {
@@ -349,6 +353,7 @@
         awaiting: "等待",
         states: {
           collecting: "收集中",
+          confirming_repair: "確認維修內容",
           confirming: "確認中",
           saving: "保存中",
           completed: "已完成",
@@ -370,6 +375,7 @@
         awaiting: "等待",
         states: {
           collecting: "收集中",
+          confirming_repair: "确认维修内容",
           confirming: "确认中",
           saving: "保存中",
           completed: "已完成",
@@ -391,6 +397,7 @@
         awaiting: "Awaiting",
         states: {
           collecting: "collecting",
+          confirming_repair: "confirming repair",
           confirming: "confirming",
           saving: "saving",
           completed: "completed",

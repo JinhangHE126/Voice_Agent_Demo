@@ -62,6 +62,7 @@ async def test_mock_session_first_audio_under_1s() -> None:
     settings = Settings(
         agent_mode="mock",
         business_mode="repair_order",
+        input_denoise_enabled=False,
         repair_order_use_llm_extractor=False,
         vad_silence_ms=40,
         min_speech_ms=40,
@@ -100,13 +101,14 @@ async def test_greeting_stays_uninterruptible_until_browser_playback_done() -> N
     settings = Settings(
         agent_mode="mock",
         business_mode="repair_order",
+        input_denoise_enabled=False,
         repair_order_use_llm_extractor=False,
         playback_done_grace_ms=0,
     )
     session = CallSession(emit=emit, settings=settings, call_id="greeting-lock")
     await session.start()
 
-    for _ in range(100):
+    for _ in range(400):
         greeting_done = any(
             e.type == "turn.done" and e.data.get("route") == "repair_greeting"
             for e in events
@@ -117,6 +119,7 @@ async def test_greeting_stays_uninterruptible_until_browser_playback_done() -> N
 
     assert greeting_done, f"greeting did not finish streaming; events={[e.type for e in events]}"
     assert session._greeting_uninterruptible is True
+    assert sum(e.type == "tts.audio" for e in events) == 1
 
     event_count = len(events)
     await session.on_pcm16(b"\x00\x20" * 320)
@@ -131,6 +134,63 @@ async def test_greeting_stays_uninterruptible_until_browser_playback_done() -> N
 
 
 @pytest.mark.asyncio
+async def test_greeting_waits_for_asr_ready_before_listening() -> None:
+    events: list[ServerEvent] = []
+
+    async def emit(ev: ServerEvent) -> None:
+        events.append(ev)
+
+    session = CallSession(
+        emit=emit,
+        settings=Settings(
+            agent_mode="mock",
+            business_mode="repair_order",
+            input_denoise_enabled=False,
+            playback_done_grace_ms=0,
+        ),
+        call_id="asr-ready-gate",
+    )
+
+    class DelayedASR:
+        def __init__(self) -> None:
+            self.ready = False
+            self.release = asyncio.Event()
+
+        @property
+        def is_ready(self) -> bool:
+            return self.ready
+
+        async def wait_until_ready(self, timeout_s: float) -> bool:
+            await asyncio.wait_for(self.release.wait(), timeout=timeout_s)
+            self.ready = True
+            return True
+
+        async def close(self) -> None:
+            return
+
+    asr = DelayedASR()
+    session._asr = asr
+    session.generation_id = 1
+    session._awaiting_playback_done = True
+    session._greeting_uninterruptible = True
+
+    await session.on_playback_done(1)
+    assert session.state == SessionState.CONNECTING_ASR
+    assert session._greeting_uninterruptible is True
+
+    asr.release.set()
+    for _ in range(20):
+        if session.state == SessionState.LISTENING:
+            break
+        await asyncio.sleep(0.01)
+
+    assert session.state == SessionState.LISTENING
+    assert session._greeting_uninterruptible is False
+    assert any(event.type == "asr.ready" for event in events)
+    await session.close()
+
+
+@pytest.mark.asyncio
 async def test_asr_watchdog_forces_end_when_no_partial_progress() -> None:
     events: list[ServerEvent] = []
 
@@ -140,6 +200,7 @@ async def test_asr_watchdog_forces_end_when_no_partial_progress() -> None:
     settings = Settings(
         agent_mode="mock",
         business_mode="faq",
+        input_denoise_enabled=False,
         asr_no_progress_timeout_ms=120,
         vad_webrtc_mode=None,
     )
