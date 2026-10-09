@@ -171,6 +171,54 @@ def test_extract_name_from_self_intro() -> None:
     assert out.customer_name == "陈先生"
 
 
+def test_expected_name_accepts_spoken_single_surname() -> None:
+    assert (
+        extract_info(
+            "哎，你好，我 姓何。",
+            expected_field="customer_name",
+        ).customer_name
+        == "何"
+    )
+    assert (
+        extract_info(
+            "哎，我姓何。",
+            expected_field="customer_name",
+        ).customer_name
+        == "何"
+    )
+
+
+def test_spoken_single_surname_asks_preferred_title() -> None:
+    manager = DialogManager()
+    draft = RepairOrderDraft(awaiting_field="customer_name")
+
+    turn = manager.process_user_text(
+        "surname",
+        draft,
+        "哎，你好，我 姓何。",
+    )
+
+    assert draft.customer_name == "何"
+    assert draft.customer_name_needs_title is True
+    assert turn.plan.prompt_id == "ask_name_title"
+    assert turn.plan.expected_field == "customer_name_title"
+
+
+def test_standalone_title_completes_spoken_surname() -> None:
+    manager = DialogManager()
+    draft = RepairOrderDraft(
+        customer_name="何",
+        customer_name_needs_title=True,
+        awaiting_field="customer_name_title",
+    )
+
+    turn = manager.process_user_text("title", draft, "先生就可以了")
+
+    assert draft.customer_name == "何先生"
+    assert draft.customer_name_needs_title is False
+    assert turn.plan.prompt_id == "ask_repair"
+
+
 def test_expected_name_strips_call_me_prefix() -> None:
     out = extract_info("叫我何先生", expected_field="customer_name")
     assert out.customer_name == "何先生"
@@ -184,6 +232,23 @@ def test_expected_name_strips_conversational_suffix() -> None:
 def test_expected_name_strips_asr_conversational_tail() -> None:
     out = extract_info("你叫我何先生著好了", expected_field="customer_name")
     assert out.customer_name == "何先生"
+
+
+def test_name_extraction_prefers_complete_titled_self_introduction() -> None:
+    out = extract_info(
+        "哎，我姓何，您叫我何先生就行。",
+        expected_field="customer_name",
+    )
+    assert out.customer_name == "何先生"
+
+
+def test_address_sentence_is_not_extracted_as_customer_name() -> None:
+    out = extract_info(
+        "我是九龙半岛油尖旺区佐敦文乐街文苑楼九幺幺B室。",
+        expected_field="customer_address",
+    )
+    assert out.customer_name is None
+    assert out.customer_address is not None
 
 
 def test_expected_name_rejects_greeting_and_laughter_noise() -> None:
@@ -289,7 +354,55 @@ def test_short_cantonese_confirmation_still_works() -> None:
     assert extract_info("就是。").is_confirm is True
     assert extract_info("就係。").is_confirm is True
     assert extract_info("就系。").is_confirm is True
+    assert extract_info("Uh yes.").is_confirm is True
+    assert extract_info("可以了。").is_confirm is True
+    assert extract_info("嗯，安了，不需要改。").is_confirm is True
+    assert extract_info("阿拉。").is_confirm is True
+    assert extract_info("赔了。").is_confirm is True
+    assert extract_info("需要改，可以了。").is_confirm is False
     assert extract_info("It's.").is_confirm is False
+
+
+def test_no_change_phrase_confirms_address() -> None:
+    manager = DialogManager()
+    draft = RepairOrderDraft(
+        customer_name="何",
+        customer_phone="51266237",
+        customer_address="九龙油尖旺区佐敦吴苑街吴苑楼九楼九二一C室",
+        repair_description="电脑主机进水，无法开机",
+        repair_confirmed=True,
+        state=OrderState.CONFIRMING_ADDRESS,
+    )
+
+    turn = manager.process_user_text(
+        "confirm-address",
+        draft,
+        "嗯，安了，不需要改。",
+    )
+
+    assert draft.address_confirmed is True
+    assert turn.plan.prompt_id == "confirm_order"
+
+
+def test_address_correction_does_not_overwrite_existing_customer_name() -> None:
+    manager = DialogManager()
+    draft = RepairOrderDraft(
+        customer_name="何先生",
+        customer_phone="51266237",
+        customer_address="旧地址",
+        repair_description="电脑主机进水",
+        repair_confirmed=True,
+        state=OrderState.CONFIRMING_ADDRESS,
+    )
+
+    manager.process_user_text(
+        "address-correction",
+        draft,
+        "我是九龙半岛油尖旺区佐敦文乐街文苑楼九幺幺B室。",
+    )
+
+    assert draft.customer_name == "何先生"
+    assert draft.customer_address != "旧地址"
 
 
 def test_expected_name_rejects_asr_sentence() -> None:

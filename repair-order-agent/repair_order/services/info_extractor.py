@@ -20,13 +20,15 @@ _PHONE_CUE_RE = re.compile(
 )
 _DIGIT_ONLY_RE = re.compile(r"^[\d\s\-]+$")
 _SELF_NAME_RE = re.compile(
-    r"(?:我叫|叫我|称呼我|稱呼我|我係|我是|姓名(?:係|是)?|my name is)\s*"
+    r"(?:我叫|我\s*姓|叫我|称呼我|稱呼我|我係|我是|"
+    r"姓名(?:係|是)?|my name is)\s*"
     r"([^\s，。,.!！?？]{1,16})",
     re.IGNORECASE,
 )
 _TITLE_NAME_RE = re.compile(r"([^\s，。,.!！?？]{1,12}(?:先生|小姐|太太|女士|生))")
 _SELF_NAME_CUES = (
     "我叫",
+    "我姓",
     "叫我",
     "称呼我",
     "稱呼我",
@@ -72,6 +74,30 @@ _NAME_REJECT_SUBSTRINGS = (
     "您好",
     "明白",
     "收到",
+)
+_NAME_ADDRESS_MARKERS = (
+    "香港",
+    "九龙",
+    "九龍",
+    "新界",
+    "地址",
+    "住址",
+    "地区",
+    "地區",
+    "大厦",
+    "大廈",
+    "屋苑",
+    "区",
+    "區",
+    "街",
+    "路",
+    "道",
+    "楼",
+    "樓",
+    "室",
+    "座",
+    "号",
+    "號",
 )
 
 _CN_DIGIT_MAP = {
@@ -173,6 +199,20 @@ _CONFIRM_FULL_UTTERANCES = {
     "確認",
     "没问题啊",
     "沒問題啊",
+    "可以了",
+    "可以喇",
+    "不需要改",
+    "不用改",
+    "唔需要改",
+    "唔使改",
+    "冇嘢要改",
+    "没有要改",
+    # Frequent ASR substitutions for Cantonese “啱啦／啱了”.
+    "阿拉",
+    "安了",
+    "啱了",
+    "赔了",
+    "安了不需要改",
 }
 _DENY_WORDS = {
     "唔啱",
@@ -850,9 +890,18 @@ def _is_low_information_utterance(text: str | None) -> bool:
 
 
 def _extract_name(text: str) -> str | None:
-    match = _SELF_NAME_RE.search(text)
-    if match:
-        return match.group(1).strip()
+    candidates = [
+        match.group(1).strip()
+        for match in _SELF_NAME_RE.finditer(text)
+        if match.group(1).strip()
+    ]
+    if candidates:
+        # A sentence may contain both “我姓何” and the more useful
+        # “叫我何先生就行”. Prefer the candidate carrying a title.
+        titled = [
+            candidate for candidate in candidates if _TITLE_NAME_RE.search(candidate)
+        ]
+        return max(titled or candidates, key=len)
     title = _TITLE_NAME_RE.search(text.strip(" ，。,.!！?？"))
     if title:
         return title.group(1).strip()
@@ -902,6 +951,12 @@ def _standalone_name_valid(candidate: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z][A-Za-z' -]{1,29}", candidate))
 
 
+def _has_self_name_cue(text: str) -> bool:
+    return any(cue in text for cue in _SELF_NAME_CUES) or bool(
+        re.search(r"我\s*姓", text)
+    )
+
+
 def _normalize_name(
     text: str | None,
     full_text: str,
@@ -926,15 +981,17 @@ def _normalize_name(
     title = _TITLE_NAME_RE.search(candidate)
     if title and (
         expected_field == "customer_name"
-        or any(cue in full_text for cue in _SELF_NAME_CUES)
+        or _has_self_name_cue(full_text)
     ):
         candidate = title.group(1).strip()
 
-    if len(candidate) <= 1 and not full_text.startswith("我姓"):
+    if len(candidate) <= 1 and not re.search(r"我\s*姓", full_text):
         return None
     if _is_social_only(candidate):
         return None
     if any(token in candidate for token in _NAME_REJECT_SUBSTRINGS):
+        return None
+    if any(marker in candidate for marker in _NAME_ADDRESS_MARKERS):
         return None
     if re.search(r"[，。,.!！?？、:：;；]", candidate):
         return None
@@ -944,9 +1001,17 @@ def _normalize_name(
         return None
     if candidate in {"明白小姐", "先生", "小姐"}:
         return None
+    if (
+        re.search(r"(?:我係|我是)\s*" + re.escape(candidate), full_text)
+        and not _TITLE_NAME_RE.search(candidate)
+        and not _standalone_name_valid(candidate)
+    ):
+        # “我是…” is ambiguous and is frequently followed by an address or
+        # other factual sentence. Only accept a plausible short name here.
+        return None
 
     if expected_field == "customer_name":
-        has_self_cue = any(cue in full_text for cue in _SELF_NAME_CUES)
+        has_self_cue = _has_self_name_cue(full_text)
         has_title = bool(_TITLE_NAME_RE.fullmatch(candidate))
         if not (has_self_cue or has_title or _standalone_name_valid(candidate)):
             return None
@@ -954,9 +1019,7 @@ def _normalize_name(
             return None
         return candidate
 
-    if _TITLE_NAME_RE.fullmatch(candidate) and not any(
-        cue in full_text for cue in _SELF_NAME_CUES
-    ):
+    if _TITLE_NAME_RE.fullmatch(candidate) and not _has_self_name_cue(full_text):
         # Accept short standalone reply like "陈先生" even if we're asking another slot.
         if full_text.strip(" ，。,.!！?？") == candidate:
             return candidate
@@ -1074,7 +1137,21 @@ def _detect_intent(text: str, is_confirm: bool, is_deny: bool) -> str:
 def _is_confirm_utterance(text: str) -> bool:
     """Accept confirmation replies, but never treat copulas inside facts as yes."""
     compact = re.sub(r"[\s，。,.!！?？、]+", "", text.lower())
-    edge_fillers = ("nala", "喂", "嗯", "呃", "额", "啊", "呀", "哦", "啦", "喇")
+    edge_fillers = (
+        "nala",
+        "erm",
+        "uh",
+        "um",
+        "喂",
+        "嗯",
+        "呃",
+        "额",
+        "啊",
+        "呀",
+        "哦",
+        "啦",
+        "喇",
+    )
     previous = None
     while compact and compact != previous:
         previous = compact

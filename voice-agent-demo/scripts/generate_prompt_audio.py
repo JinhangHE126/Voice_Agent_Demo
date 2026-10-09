@@ -19,13 +19,15 @@ from app.config import get_settings  # noqa: E402
 # Fixed prompts used by the repair-order flow.
 PROMPTS: dict[str, str] = {
     "greeting": "你好，广东话、普通话或者英文都可以。",
-    "ask_name": "请问点称呼你呀？",
+    "ask_name": "请问点称呼你？可以讲姓氏加先生或女士。",
+    "ask_name_title": "收到，请问应该称呼你做先生、女士，定係其他称呼？",
     "ask_repair": "请简单讲下要维修嘅内容。",
     "ask_phone": "请讲一下你嘅联络电话。",
     "ask_address": (
         "请讲一下维修地址。最好按呢个顺序讲：先讲香港、九龙定新界，"
         "再讲地区，然后街道同门牌，再讲大厦名，最后讲楼层同室号。"
-
+        "例如：香港湾仔坚尼地道105号雅佳大厦12楼25室。"
+    ),
     "ask_confirm_yesno": "请讲啱定唔啱；如果唔啱，可以直接讲要改边项资料。",
     "order_saved": "已经帮你登记咗维修订单，我哋会尽快安排同事联络你。",
     "invalid_phone_length": "你啱啱讲嘅电话号码位数唔啱，请逐个数字再讲一次。",
@@ -47,8 +49,7 @@ def _read_env_fallback(key: str) -> str:
         k, v = line.split("=", 1)
         if k.strip() == key:
             return v.strip().strip('"').strip("'")
-    return ""        "例如：香港湾仔坚尼地道105号雅佳大厦12楼25室。"
-    ),
+    return ""
 
 
 def _write_wav(path: Path, pcm: bytes, *, sample_rate: int) -> None:

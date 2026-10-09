@@ -18,6 +18,7 @@ class OrderState(str, Enum):
 @dataclass
 class RepairOrderDraft:
     customer_name: str | None = None
+    customer_name_needs_title: bool = False
     customer_phone: str | None = None
     customer_address: str | None = None
     repair_description: str | None = None
@@ -33,7 +34,7 @@ class RepairOrderDraft:
 
     def missing_fields(self) -> list[str]:
         missing: list[str] = []
-        if not self.customer_name:
+        if not self.customer_name or self.customer_name_needs_title:
             missing.append("customer_name")
         if not self.customer_phone:
             missing.append("customer_phone")

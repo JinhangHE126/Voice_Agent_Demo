@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from repair_order.domain.repair_order import OrderState, RepairOrderDraft
@@ -29,6 +30,33 @@ def _clean_repair_text(text: str | None) -> str:
     return (text or "").strip().rstrip("，。,.!！?？；; ")
 
 
+def _standalone_title(text: str) -> str | None:
+    compact = re.sub(r"[\s，。,.!！?？、]+", "", text)
+    for prefix in ("我是", "我係", "叫我", "称呼我", "稱呼我"):
+        compact = compact.removeprefix(prefix)
+    for suffix in (
+        "就可以了",
+        "就可以",
+        "就行了",
+        "就行",
+        "就得啦",
+        "就得",
+        "可以了",
+        "啦",
+        "喇",
+    ):
+        compact = compact.removesuffix(suffix)
+    return {
+        "先生": "先生",
+        "何生": "先生",
+        "生": "先生",
+        "女士": "女士",
+        "女仕": "女士",
+        "小姐": "小姐",
+        "太太": "太太",
+    }.get(compact)
+
+
 class DialogManager:
     _FIELD_PRIORITY = (
         "customer_name",
@@ -54,7 +82,8 @@ class DialogManager:
                 "再讲地区，然后街道同门牌，再讲大厦名，最后讲楼层同室号。"
                 "例如：香港湾仔坚尼地道105号雅佳大厦12楼25室。"
             ),
-            "ask_name": "请问点称呼你？",
+            "ask_name": "请问点称呼你？可以讲姓氏加先生或女士。",
+            "ask_name_title": "收到，请问应该称呼你做先生、女士，定係其他称呼？",
             "ask_confirm_yesno": "请讲啱或者唔啱，如果唔啱可以直接讲要改边项资料。",
             "ask_correct_field": "明白，边项要改？姓名、电话、地址，定维修内容？",
             "invalid_phone_length": "你啱啱讲嘅电话号码位数唔啱，请逐个数字再讲一次。",
@@ -78,7 +107,8 @@ class DialogManager:
                 "再说地区，然后街道和门牌，再说大厦名，最后说楼层和室号。"
                 "例如：香港湾仔坚尼地道105号雅佳大厦12楼25室。"
             ),
-            "ask_name": "请问怎么称呼您？",
+            "ask_name": "请问怎么称呼您？可以说姓氏加先生或女士。",
+            "ask_name_title": "收到，请问应该称呼您为先生、女士，还是其他称呼？",
             "ask_confirm_yesno": "请回答对或不对，如果不对请告诉我哪项需要修改。",
             "ask_correct_field": "明白，请问要修改姓名、电话、地址，还是维修内容？",
             "invalid_phone_length": "您刚才说的电话号码位数不正确，请逐位再说一次。",
@@ -105,6 +135,10 @@ class DialogManager:
                 "12th floor, unit 25."
             ),
             "ask_name": "May I have your name, please?",
+            "ask_name_title": (
+                "Thank you. How would you like to be addressed: "
+                "Mr., Ms., or another name?"
+            ),
             "ask_confirm_yesno": "Please say yes or no. If no, tell me which field to update.",
             "ask_correct_field": "Sure. Which part should I update: name, phone, address, or repair details?",
             "invalid_phone_length": "The phone number length seems invalid. Please say each digit again.",
@@ -150,9 +184,18 @@ class DialogManager:
         def conf_ok(field: str, default: float = 0.7) -> bool:
             return float(conf.get(field, default)) >= 0.55
 
-        if extracted.customer_name:
+        address_focused_turn = (
+            draft.awaiting_field == "customer_address"
+            or draft.state == OrderState.CONFIRMING_ADDRESS
+        )
+        if extracted.customer_name and not (
+            address_focused_turn and extracted.customer_address
+        ):
             if conf_ok("name", 0.75):
                 draft.customer_name = extracted.customer_name
+                draft.customer_name_needs_title = bool(
+                    re.fullmatch(r"[\u3400-\u9fff]", extracted.customer_name)
+                )
                 updated_fields.append("customer_name")
         if extracted.customer_phone:
             if conf_ok("phone", 0.8):
@@ -295,6 +338,7 @@ class DialogManager:
                 for field_name in fields_to_correct:
                     if field_name == "customer_name" and "customer_name" not in updated_fields:
                         draft.customer_name = None
+                        draft.customer_name_needs_title = False
                     elif field_name == "customer_phone" and "customer_phone" not in updated_fields:
                         draft.customer_phone = None
                     elif field_name == "customer_address" and "customer_address" not in updated_fields:
@@ -372,7 +416,15 @@ class DialogManager:
         draft: RepairOrderDraft,
         user_text: str,
     ) -> TurnResult:
-        extracted = extract_info(user_text, expected_field=draft.awaiting_field)
+        title_turn = self._apply_name_title_reply(draft, user_text)
+        if title_turn is not None:
+            return title_turn
+        expected_field = (
+            "customer_name"
+            if draft.awaiting_field == "customer_name_title"
+            else draft.awaiting_field
+        )
+        extracted = extract_info(user_text, expected_field=expected_field)
         return self._apply_extract(call_id, draft, extracted)
 
     async def process_user_text_async(
@@ -381,10 +433,40 @@ class DialogManager:
         draft: RepairOrderDraft,
         user_text: str,
     ) -> TurnResult:
+        title_turn = self._apply_name_title_reply(draft, user_text)
+        if title_turn is not None:
+            return title_turn
+        expected_field = (
+            "customer_name"
+            if draft.awaiting_field == "customer_name_title"
+            else draft.awaiting_field
+        )
         extracted = await extract_info_async(
-            user_text, expected_field=draft.awaiting_field
+            user_text, expected_field=expected_field
         )
         return self._apply_extract(call_id, draft, extracted)
+
+    def _apply_name_title_reply(
+        self,
+        draft: RepairOrderDraft,
+        user_text: str,
+    ) -> TurnResult | None:
+        if (
+            draft.awaiting_field != "customer_name_title"
+            or not draft.customer_name
+            or not draft.customer_name_needs_title
+        ):
+            return None
+        title = _standalone_title(user_text)
+        if title is None:
+            return None
+        draft.customer_name = f"{draft.customer_name}{title}"
+        draft.customer_name_needs_title = False
+        draft.awaiting_field = None
+        return TurnResult(
+            plan=self.next_prompt(draft),
+            updated_fields=["customer_name"],
+        )
 
     def next_prompt(self, draft: RepairOrderDraft) -> ResponsePlan:
         if draft.state == OrderState.COMPLETED:
@@ -394,6 +476,16 @@ class DialogManager:
                 prompt_id="completed",
                 dynamic=False,
                 expected_field=None,
+            )
+
+        if draft.customer_name and draft.customer_name_needs_title:
+            draft.state = OrderState.COLLECTING
+            draft.awaiting_field = "customer_name_title"
+            return ResponsePlan(
+                text=self._say(draft, "ask_name_title"),
+                prompt_id="ask_name_title",
+                dynamic=False,
+                expected_field="customer_name_title",
             )
 
         if (

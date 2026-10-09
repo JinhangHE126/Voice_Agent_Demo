@@ -26,6 +26,28 @@ async def test_process_user_text_async_short_answers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_process_user_text_async_completes_surname_title() -> None:
+    manager = DialogManager()
+    draft = RepairOrderDraft(awaiting_field="customer_name")
+
+    surname_turn = await manager.process_user_text_async(
+        "surname-title",
+        draft,
+        "我姓何",
+    )
+    assert surname_turn.plan.prompt_id == "ask_name_title"
+
+    title_turn = await manager.process_user_text_async(
+        "surname-title",
+        draft,
+        "女士",
+    )
+    assert draft.customer_name == "何女士"
+    assert draft.customer_name_needs_title is False
+    assert title_turn.plan.prompt_id == "ask_repair"
+
+
+@pytest.mark.asyncio
 async def test_async_extractor_skips_llm_for_expected_phone(monkeypatch) -> None:
     called = False
 
