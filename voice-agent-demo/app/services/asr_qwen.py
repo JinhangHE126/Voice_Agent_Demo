@@ -41,6 +41,15 @@ class MockStreamingASR:
         self._partial_idx = 0
         self._last_partial_at = time.perf_counter()
 
+    @property
+    def is_ready(self) -> bool:
+        return self._started and not self._closed
+
+    async def wait_until_ready(self, timeout_s: float) -> bool:
+        if not self.is_ready and timeout_s > 0:
+            await asyncio.sleep(0)
+        return self.is_ready
+
     async def push_pcm16(self, pcm: bytes) -> None:
         if not self._started or self._closed or self._finalized:
             return
@@ -55,7 +64,7 @@ class MockStreamingASR:
             self._last_partial_at = now
             await self.on_partial(text)
 
-    async def end_utterance(self) -> None:
+    async def end_utterance(self, *, fast_fail: bool = False) -> None:
         if self._finalized or self._closed:
             return
         self._finalized = True
@@ -85,6 +94,7 @@ class QwenRealtimeASR:
         ws_url: str = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
         silence_ms: int = 400,
         final_timeout_ms: int = 2500,
+        hard_timeout_ms: int = 5000,
         on_partial: PartialCallback | None = None,
         on_final: FinalCallback | None = None,
     ) -> None:
@@ -96,12 +106,14 @@ class QwenRealtimeASR:
         self.ws_url = ws_url
         self.silence_ms = silence_ms
         self.final_timeout_ms = max(500, int(final_timeout_ms))
+        self.hard_timeout_ms = max(self.final_timeout_ms, int(hard_timeout_ms))
         self.on_partial = on_partial
         self.on_final = on_final
         self._ws = None
         self._reader_task: asyncio.Task | None = None
         self._closed = False
         self._final_event = asyncio.Event()
+        self._session_ready_event = asyncio.Event()
         self._last_final = ""
         self._partial = ""
         self._final_dispatched = False
@@ -147,6 +159,7 @@ class QwenRealtimeASR:
             ping_interval=20.0,
             ping_timeout=20.0,
         )
+        self._session_ready_event.clear()
         await ws.send(
             json.dumps(
                 {
@@ -173,11 +186,17 @@ class QwenRealtimeASR:
         self._last_final = ""
         self._partial = ""
         self._reader_task = asyncio.create_task(self._read_loop(ws))
+        try:
+            await asyncio.wait_for(self._session_ready_event.wait(), timeout=3.0)
+        except Exception:
+            await self._drop_connection(ws)
+            raise
 
     async def _detach_connection(self, ws) -> None:
         """Stop routing events from a stale socket without waiting for close."""
         if self._ws is ws:
             self._ws = None
+            self._session_ready_event.clear()
         reader = self._reader_task
         if (
             reader
@@ -235,6 +254,38 @@ class QwenRealtimeASR:
         # Connection warm-up runs behind the greeting instead of delaying it.
         await asyncio.sleep(0)
 
+    @property
+    def is_ready(self) -> bool:
+        return (
+            not self._closed
+            and self._ws is not None
+            and self._session_ready_event.is_set()
+            and self._reader_task is not None
+            and not self._reader_task.done()
+        )
+
+    async def wait_until_ready(self, timeout_s: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while not self.is_ready and not self._closed:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self._schedule_reconnect(force=True)
+            task = self._reconnect_task
+            if task is None:
+                await asyncio.sleep(min(0.2, remaining))
+                continue
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=min(remaining, 8.5),
+                )
+            except asyncio.TimeoutError:
+                pass
+            if not self.is_ready:
+                await asyncio.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+        return self.is_ready
+
     def _schedule_reconnect(self, *, force: bool = False) -> None:
         if self._closed:
             return
@@ -279,7 +330,9 @@ class QwenRealtimeASR:
                 except json.JSONDecodeError:
                     continue
                 event = msg.get("type") or ""
-                if event == "conversation.item.input_audio_transcription.delta":
+                if event == "session.updated":
+                    self._session_ready_event.set()
+                elif event == "conversation.item.input_audio_transcription.delta":
                     text = (
                         msg.get("delta")
                         or msg.get("text")
@@ -318,6 +371,7 @@ class QwenRealtimeASR:
         finally:
             if self._ws is ws:
                 self._ws = None
+                self._session_ready_event.clear()
             if self._reader_task is asyncio.current_task():
                 self._reader_task = None
 
@@ -494,7 +548,7 @@ class QwenRealtimeASR:
             # is preserved instead of being replaced again.
             await self._reconnect(ws, force=True)
 
-    async def end_utterance(self) -> None:
+    async def _end_utterance_impl(self, *, fast_fail: bool = False) -> None:
         """Commit one utterance and provide a timeout fallback final callback."""
         if self._closed:
             return
@@ -548,9 +602,20 @@ class QwenRealtimeASR:
         try:
             await asyncio.wait_for(
                 self._final_event.wait(),
-                timeout=self.final_timeout_ms / 1000.0,
+                timeout=(
+                    min(self.final_timeout_ms, 1200)
+                    if fast_fail
+                    else self.final_timeout_ms
+                )
+                / 1000.0,
             )
         except asyncio.TimeoutError:
+            if fast_fail and not self._partial:
+                await self._recover_failed_utterance(
+                    ws,
+                    reason="short_utterance_timeout",
+                )
+                return
             # If DashScope produced no partial at all, replay the locally
             # buffered utterance once on a fresh connection before giving up.
             if not self._partial:
@@ -564,6 +629,29 @@ class QwenRealtimeASR:
                 self._ws or ws,
                 reason="final_timeout",
             )
+
+    async def end_utterance(self, *, fast_fail: bool = False) -> None:
+        try:
+            await asyncio.wait_for(
+                self._end_utterance_impl(fast_fail=fast_fail),
+                timeout=self.hard_timeout_ms / 1000.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Qwen ASR hard timeout after %dms; returning empty final",
+                self.hard_timeout_ms,
+            )
+            if self._final_dispatched:
+                return
+            failed_ws = self._ws
+            await self._detach_connection(failed_ws)
+            await self._dispatch_final("", self.language or "yue")
+            if failed_ws:
+                try:
+                    await asyncio.wait_for(failed_ws.close(), timeout=0.25)
+                except Exception:
+                    pass
+            self._schedule_reconnect(force=True)
 
     async def close(self) -> None:
         self._closed = True

@@ -127,6 +127,20 @@ async def test_greeting_stays_uninterruptible_until_browser_playback_done() -> N
     assert session._greeting_uninterruptible is True
 
     await session.on_playback_done(session.generation_id)
+    for _ in range(100):
+        ask_name_done = any(
+            e.type == "turn.done" and e.data.get("route") == "repair_ask_name"
+            for e in events
+        )
+        if ask_name_done:
+            break
+        await asyncio.sleep(0.01)
+
+    assert ask_name_done
+    assert session._greeting_uninterruptible is True
+    assert sum(e.type == "tts.audio" for e in events) == 2
+
+    await session.on_playback_done(session.generation_id)
     assert session._greeting_uninterruptible is False
     assert session.state.value == "listening"
 
@@ -173,20 +187,149 @@ async def test_greeting_waits_for_asr_ready_before_listening() -> None:
     session.generation_id = 1
     session._awaiting_playback_done = True
     session._greeting_uninterruptible = True
+    session._startup_phase = "greeting"
 
     await session.on_playback_done(1)
     assert session.state == SessionState.CONNECTING_ASR
     assert session._greeting_uninterruptible is True
+    assert any(
+        event.type == "prompt.audio"
+        and event.data.get("prompt_id") == "connecting_asr"
+        for event in events
+    )
 
     asr.release.set()
-    for _ in range(20):
-        if session.state == SessionState.LISTENING:
+    for _ in range(100):
+        ask_name_done = any(
+            event.type == "turn.done"
+            and event.data.get("route") == "repair_ask_name"
+            for event in events
+        )
+        if ask_name_done:
             break
         await asyncio.sleep(0.01)
 
+    assert ask_name_done
+    assert session.state == SessionState.SPEAKING
+    assert session._greeting_uninterruptible is True
+    assert any(event.type == "asr.ready" for event in events)
+
+    await session.on_playback_done(session.generation_id)
     assert session.state == SessionState.LISTENING
     assert session._greeting_uninterruptible is False
-    assert any(event.type == "asr.ready" for event in events)
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_asr_timeout_plays_unavailable_prompt() -> None:
+    events: list[ServerEvent] = []
+
+    async def emit(ev: ServerEvent) -> None:
+        events.append(ev)
+
+    session = CallSession(
+        emit=emit,
+        settings=Settings(
+            agent_mode="mock",
+            business_mode="repair_order",
+            input_denoise_enabled=False,
+            playback_done_grace_ms=0,
+            asr_startup_timeout_ms=20,
+        ),
+        call_id="asr-startup-timeout",
+    )
+
+    class NeverReadyASR:
+        @property
+        def is_ready(self) -> bool:
+            return False
+
+        async def wait_until_ready(self, timeout_s: float) -> bool:
+            await asyncio.sleep(timeout_s)
+            return False
+
+        async def close(self) -> None:
+            return
+
+    session._asr = NeverReadyASR()
+    session.generation_id = 1
+    session._awaiting_playback_done = True
+    session._greeting_uninterruptible = True
+    session._startup_phase = "greeting"
+
+    await session.on_playback_done(1)
+    await asyncio.sleep(0.08)
+
+    assert session._startup_phase == "failed"
+    assert session.state == SessionState.CONNECTING_ASR
+    assert any(
+        event.type == "prompt.audio"
+        and event.data.get("prompt_id") == "asr_unavailable"
+        for event in events
+    )
+    assert any(event.type == "error" for event in events)
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_endpointing_plays_local_wait_prompt_after_delay() -> None:
+    events: list[ServerEvent] = []
+
+    async def emit(ev: ServerEvent) -> None:
+        events.append(ev)
+
+    session = CallSession(
+        emit=emit,
+        settings=Settings(
+            agent_mode="mock",
+            business_mode="repair_order",
+            input_denoise_enabled=False,
+            asr_wait_prompt_delay_ms=10,
+        ),
+        call_id="asr-wait-prompt",
+    )
+    session.state = SessionState.ENDPOINTING
+    session._start_asr_wait_prompt()
+    await asyncio.sleep(0.05)
+
+    assert any(
+        event.type == "prompt.audio"
+        and event.data.get("prompt_id") == "please_wait_asr"
+        for event in events
+    )
+    assert any(event.type == "tts.audio" for event in events)
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_asr_final_reprompts_current_repair_field() -> None:
+    events: list[ServerEvent] = []
+
+    async def emit(ev: ServerEvent) -> None:
+        events.append(ev)
+
+    session = CallSession(
+        emit=emit,
+        settings=Settings(
+            agent_mode="mock",
+            business_mode="repair_order",
+            input_denoise_enabled=False,
+        ),
+        call_id="asr-empty-reprompt",
+    )
+    session.dialog.greeting(session.draft)
+
+    await session._on_asr_final("", lang="yue")
+    for _ in range(20):
+        if any(event.type == "prompt.audio" for event in events):
+            break
+        await asyncio.sleep(0.01)
+
+    assert any(
+        event.type == "prompt.audio"
+        and event.data.get("prompt_id") == "ask_name"
+        for event in events
+    )
     await session.close()
 
 
@@ -214,7 +357,7 @@ async def test_asr_watchdog_forces_end_when_no_partial_progress() -> None:
         async def push_pcm16(self, pcm: bytes) -> None:
             return
 
-        async def end_utterance(self) -> None:
+        async def end_utterance(self, *, fast_fail: bool = False) -> None:
             self.end_called.set()
 
         async def close(self) -> None:
@@ -269,7 +412,7 @@ async def test_barge_in_preserves_vad_until_short_utterance_ends() -> None:
         async def push_pcm16(self, pcm: bytes) -> None:
             self.pushed.extend(pcm)
 
-        async def end_utterance(self) -> None:
+        async def end_utterance(self, *, fast_fail: bool = False) -> None:
             self.end_called.set()
 
         async def close(self) -> None:

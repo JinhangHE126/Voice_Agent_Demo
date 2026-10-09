@@ -18,11 +18,11 @@ async def test_process_user_text_async_short_answers() -> None:
     manager.greeting(draft)
 
     t1 = await manager.process_user_text_async("c1", draft, "屋企冷气唔冻")
-    assert t1.plan.prompt_id == "ask_phone"
+    assert t1.plan.prompt_id == "ask_name"
 
     t2 = await manager.process_user_text_async("c1", draft, "陈先生")
     assert draft.customer_name == "陈先生"
-    assert t2.plan.prompt_id == "ask_phone"
+    assert t2.plan.prompt_id == "confirm_repair"
 
 
 @pytest.mark.asyncio

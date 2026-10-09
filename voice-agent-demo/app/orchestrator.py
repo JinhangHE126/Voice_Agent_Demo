@@ -261,6 +261,7 @@ class CallSession:
                 "customer_address": self.draft.customer_address,
                 "repair_description": self.draft.repair_description,
                 "repair_confirmed": self.draft.repair_confirmed,
+                "address_confirmed": self.draft.address_confirmed,
                 "state": self.draft.state.value,
                 "awaiting_field": self.draft.awaiting_field,
                 "session_language": self.draft.session_language,
@@ -909,6 +910,7 @@ class CallSession:
                             "customer_address": self.draft.customer_address,
                             "repair_description": self.draft.repair_description,
                             "repair_confirmed": self.draft.repair_confirmed,
+                            "address_confirmed": self.draft.address_confirmed,
                             "state": self.draft.state.value,
                             "awaiting_field": self.draft.awaiting_field,
                             "session_language": self.draft.session_language,
@@ -980,6 +982,7 @@ class CallSession:
                     "customer_address": self.draft.customer_address,
                     "repair_description": self.draft.repair_description,
                     "repair_confirmed": self.draft.repair_confirmed,
+                    "address_confirmed": self.draft.address_confirmed,
                     "state": self.draft.state.value,
                     "awaiting_field": self.draft.awaiting_field,
                     "session_language": self.draft.session_language,
@@ -993,7 +996,8 @@ class CallSession:
             )
             logger.info(
                 "draft_update call=%s updated_fields=%s awaiting=%s state=%s "
-                "name=%r phone=%r address=%r repair=%r repair_confirmed=%s",
+                "name=%r phone=%r address=%r repair=%r repair_confirmed=%s "
+                "address_confirmed=%s",
                 self.call_id,
                 turn.updated_fields or [],
                 self.draft.awaiting_field,
@@ -1003,6 +1007,7 @@ class CallSession:
                 self.draft.customer_address,
                 self.draft.repair_description,
                 self.draft.repair_confirmed,
+                self.draft.address_confirmed,
             )
             await self._speak_text(
                 turn.plan.text,

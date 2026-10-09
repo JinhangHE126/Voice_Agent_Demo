@@ -6,6 +6,10 @@ from enum import Enum
 
 class OrderState(str, Enum):
     COLLECTING = "collecting"
+    CONFIRMING_REPAIR = "confirming_repair"
+    CONFIRMING_ADDRESS = "confirming_address"
+    CONFIRMING_ORDER = "confirming"
+    # Backward-compatible alias for callers/tests that used the old name.
     CONFIRMING = "confirming"
     SAVING = "saving"
     COMPLETED = "completed"
@@ -17,6 +21,8 @@ class RepairOrderDraft:
     customer_phone: str | None = None
     customer_address: str | None = None
     repair_description: str | None = None
+    repair_confirmed: bool = False
+    address_confirmed: bool = False
     confirmed: bool = False
     state: OrderState = OrderState.COLLECTING
     awaiting_field: str | None = None

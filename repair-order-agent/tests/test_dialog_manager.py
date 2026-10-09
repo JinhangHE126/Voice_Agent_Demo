@@ -6,12 +6,12 @@ from repair_order.services.dialog_manager import DialogManager
 from repair_order.services.info_extractor import extract_info
 
 
-def test_next_prompt_asks_language_first_when_unknown() -> None:
+def test_next_prompt_asks_name_first() -> None:
     manager = DialogManager()
     draft = RepairOrderDraft()
     plan = manager.next_prompt(draft)
-    assert plan.prompt_id == "ask_language"
-    assert plan.expected_field is None
+    assert plan.prompt_id == "ask_name"
+    assert plan.expected_field == "customer_name"
 
 
 def test_next_prompt_goes_to_confirm_when_all_fields_ready() -> None:
@@ -21,6 +21,8 @@ def test_next_prompt_goes_to_confirm_when_all_fields_ready() -> None:
         customer_phone="91234567",
         customer_address="旺角弥敦道100号",
         repair_description="冷气不制冷",
+        repair_confirmed=True,
+        address_confirmed=True,
     )
     plan = manager.next_prompt(draft)
     assert plan.prompt_id == "confirm_order"
@@ -38,19 +40,39 @@ def test_process_user_text_collect_confirm_save() -> None:
         draft=draft,
         user_text="我叫陈先生，电话9123 4567，地址旺角弥敦道100号，冷气唔冻要维修。",
     )
-    assert turn1.plan.prompt_id == "confirm_order"
+    assert turn1.plan.prompt_id == "confirm_repair"
     assert draft.customer_name is not None
     assert draft.customer_phone == "91234567"
     assert draft.customer_address == "旺角弥敦道100号"
-    assert draft.state == OrderState.CONFIRMING
+    assert draft.state == OrderState.CONFIRMING_REPAIR
 
     turn2 = manager.process_user_text(
         call_id="call-001",
         draft=draft,
         user_text="啱",
     )
-    assert turn2.saved is True
-    assert turn2.plan.prompt_id == "order_saved"
+    assert turn2.saved is False
+    assert turn2.plan.prompt_id == "confirm_address"
+    assert draft.state == OrderState.CONFIRMING_ADDRESS
+    assert draft.repair_confirmed is True
+
+    turn3 = manager.process_user_text(
+        call_id="call-001",
+        draft=draft,
+        user_text="啱",
+    )
+    assert turn3.saved is False
+    assert turn3.plan.prompt_id == "confirm_order"
+    assert draft.state == OrderState.CONFIRMING_ORDER
+    assert draft.address_confirmed is True
+
+    turn4 = manager.process_user_text(
+        call_id="call-001",
+        draft=draft,
+        user_text="啱",
+    )
+    assert turn4.saved is True
+    assert turn4.plan.prompt_id == "order_saved"
     assert draft.state == OrderState.COMPLETED
     assert len(repo.saved_orders) == 1
 
@@ -62,6 +84,8 @@ def test_process_user_text_deny_and_correct_phone() -> None:
         customer_phone="91234567",
         customer_address="旺角弥敦道100号",
         repair_description="冷气唔冻",
+        repair_confirmed=True,
+        address_confirmed=True,
         state=OrderState.CONFIRMING,
     )
 
@@ -82,6 +106,8 @@ def test_confirming_deny_asks_which_field_when_unspecified() -> None:
         customer_phone="91234567",
         customer_address="旺角弥敦道100号",
         repair_description="冷气唔冻",
+        repair_confirmed=True,
+        address_confirmed=True,
         state=OrderState.CONFIRMING,
     )
     turn = manager.process_user_text(
@@ -93,6 +119,44 @@ def test_confirming_deny_asks_which_field_when_unspecified() -> None:
     assert draft.customer_name == "陈先生"
     assert draft.customer_phone == "91234567"
     assert draft.customer_address == "旺角弥敦道100号"
+
+
+def test_repair_denial_clears_only_repair_and_collects_it_again() -> None:
+    manager = DialogManager()
+    draft = RepairOrderDraft(
+        customer_name="陈先生",
+        repair_description="冷气唔冻",
+        state=OrderState.CONFIRMING_REPAIR,
+    )
+
+    turn = manager.process_user_text("repair-deny", draft, "唔啱")
+
+    assert draft.customer_name == "陈先生"
+    assert draft.repair_description is None
+    assert draft.repair_confirmed is False
+    assert turn.plan.prompt_id == "ask_repair"
+
+
+def test_address_denial_clears_only_address_and_collects_it_again() -> None:
+    manager = DialogManager()
+    draft = RepairOrderDraft(
+        customer_name="陈先生",
+        customer_phone="91234567",
+        customer_address="旺角弥敦道100号",
+        repair_description="冷气唔冻",
+        repair_confirmed=True,
+        state=OrderState.CONFIRMING_ADDRESS,
+    )
+
+    turn = manager.process_user_text("address-deny", draft, "唔啱")
+
+    assert draft.customer_name == "陈先生"
+    assert draft.customer_phone == "91234567"
+    assert draft.customer_address is None
+    assert draft.address_confirmed is False
+    assert draft.repair_confirmed is True
+    assert turn.plan.prompt_id == "ask_address"
+    assert "九龙" in turn.plan.text or "九龍" in turn.plan.text or "香港" in turn.plan.text
 
 
 def test_extract_name_requires_self_intro_context() -> None:
@@ -305,22 +369,30 @@ def test_multi_turn_short_answers_with_expected_field() -> None:
     greeting = manager.greeting(draft)
     assert greeting.prompt_id == "greeting"
 
-    t1 = manager.process_user_text("c1", draft, "屋企冷气唔冻")
-    assert draft.repair_description is not None
-    assert t1.plan.prompt_id == "ask_phone"
-
-    t2 = manager.process_user_text("c1", draft, "九一二三四五六七")
-    assert draft.customer_phone == "91234567"
-    assert t2.plan.prompt_id == "ask_address"
-
-    t3 = manager.process_user_text("c1", draft, "旺角弥敦道100号")
-    assert draft.customer_address == "旺角弥敦道100号"
-    assert t3.plan.prompt_id == "ask_name"
-
-    t4 = manager.process_user_text("c1", draft, "陈先生")
+    t1 = manager.process_user_text("c1", draft, "陈先生")
     assert draft.customer_name == "陈先生"
-    assert t4.plan.prompt_id == "confirm_order"
+    assert t1.plan.prompt_id == "ask_repair"
 
-    t5 = manager.process_user_text("c1", draft, "啱")
-    assert t5.saved is True
+    t2 = manager.process_user_text("c1", draft, "屋企冷气唔冻")
+    assert draft.repair_description is not None
+    assert t2.plan.prompt_id == "confirm_repair"
+
+    t3 = manager.process_user_text("c1", draft, "啱")
+    assert draft.repair_confirmed is True
+    assert t3.plan.prompt_id == "ask_phone"
+
+    t4 = manager.process_user_text("c1", draft, "九一二三四五六七")
+    assert draft.customer_phone == "91234567"
+    assert t4.plan.prompt_id == "ask_address"
+
+    t5 = manager.process_user_text("c1", draft, "旺角弥敦道100号")
+    assert draft.customer_address == "旺角弥敦道100号"
+    assert t5.plan.prompt_id == "confirm_address"
+
+    t6 = manager.process_user_text("c1", draft, "啱")
+    assert draft.address_confirmed is True
+    assert t6.plan.prompt_id == "confirm_order"
+
+    t7 = manager.process_user_text("c1", draft, "啱")
+    assert t7.saved is True
     assert draft.state == OrderState.COMPLETED

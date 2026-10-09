@@ -14,29 +14,34 @@ class FakeWebSocket:
         self.fail_event = fail_event
         self.sent: list[dict] = []
         self._closed = asyncio.Event()
+        self._messages: asyncio.Queue[str | None] = asyncio.Queue()
 
     async def send(self, raw: str) -> None:
         payload = json.loads(raw)
         if payload.get("type") == self.fail_event:
             raise ConnectionError(f"failed {self.fail_event}")
         self.sent.append(payload)
+        if payload.get("type") == "session.update":
+            await self._messages.put(json.dumps({"type": "session.updated"}))
 
     async def close(self) -> None:
+        await self._messages.put(None)
         self._closed.set()
 
     def __aiter__(self):
         return self
 
     async def __anext__(self):
-        await self._closed.wait()
-        raise StopAsyncIteration
+        item = await self._messages.get()
+        if item is None:
+            raise StopAsyncIteration
+        return item
 
 
 class CompletingWebSocket(FakeWebSocket):
     def __init__(self, transcript: str) -> None:
         super().__init__()
         self.transcript = transcript
-        self._messages: asyncio.Queue[str | None] = asyncio.Queue()
 
     async def send(self, raw: str) -> None:
         await super().send(raw)
@@ -51,17 +56,6 @@ class CompletingWebSocket(FakeWebSocket):
                     }
                 )
             )
-
-    async def close(self) -> None:
-        await self._messages.put(None)
-        await super().close()
-
-    async def __anext__(self):
-        item = await self._messages.get()
-        if item is None:
-            raise StopAsyncIteration
-        return item
-
 
 @pytest.mark.asyncio
 async def test_qwen_asr_initial_timeout_does_not_abort_session(monkeypatch) -> None:
@@ -267,6 +261,87 @@ async def test_empty_timeout_replays_buffer_on_fresh_connection(monkeypatch) -> 
         for item in second.sent
     )
     assert asr._utterance_pcm == bytearray()
+    await asr.close()
+
+
+@pytest.mark.asyncio
+async def test_short_utterance_timeout_returns_empty_without_replay(
+    monkeypatch,
+) -> None:
+    first = FakeWebSocket()
+    second = FakeWebSocket()
+    sockets = iter((first, second))
+    finals: list[tuple[str, str]] = []
+
+    async def fake_connect(*args, **kwargs):
+        return next(sockets)
+
+    async def on_final(text: str, lang: str) -> None:
+        finals.append((text, lang))
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+    asr = QwenRealtimeASR(
+        api_key="test",
+        language="yue",
+        final_timeout_ms=500,
+        hard_timeout_ms=2000,
+        on_final=on_final,
+    )
+    await asr.start()
+    assert await asr.wait_until_ready(0.5)
+    asr.mark_speech_start()
+    await asr.push_pcm16(b"\x01\x02" * 320)
+    asr.mark_speech_end()
+
+    await asr.end_utterance(fast_fail=True)
+
+    assert finals == [("", "yue")]
+    assert not any(
+        item.get("type") == "input_audio_buffer.append"
+        for item in second.sent
+    )
+    await asr.close()
+
+
+@pytest.mark.asyncio
+async def test_hard_timeout_returns_empty_while_reconnect_is_stalled(
+    monkeypatch,
+) -> None:
+    first = FakeWebSocket()
+    stall = asyncio.Event()
+    connect_count = 0
+    final_called = asyncio.Event()
+
+    async def fake_connect(*args, **kwargs):
+        nonlocal connect_count
+        connect_count += 1
+        if connect_count == 1:
+            return first
+        await stall.wait()
+        return FakeWebSocket()
+
+    async def on_final(text: str, lang: str) -> None:
+        assert text == ""
+        final_called.set()
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+    asr = QwenRealtimeASR(
+        api_key="test",
+        language="yue",
+        final_timeout_ms=500,
+        hard_timeout_ms=700,
+        on_final=on_final,
+    )
+    await asr.start()
+    assert await asr.wait_until_ready(0.5)
+    asr.mark_speech_start()
+    await asr.push_pcm16(b"\x01\x02" * 1600)
+    asr.mark_speech_end()
+
+    await asyncio.wait_for(asr.end_utterance(), timeout=1.0)
+
+    assert final_called.is_set()
+    assert connect_count >= 2
     await asr.close()
 
 
