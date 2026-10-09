@@ -105,6 +105,7 @@ class CallSession:
         self._asr_wait_prompt_task: asyncio.Task | None = None
         self._pending_asr_reprompt = None
         self._call_completed = False
+        self._asr_empty_count = 0
 
         self.business_mode = (
             self.settings.business_mode.strip().lower() or "repair_order"
@@ -673,13 +674,23 @@ class CallSession:
         if self._handling_final:
             return
         if not text:
-            logger.info("asr_final empty call=%s lang=%s", self.call_id, lang)
+            self._asr_empty_count += 1
+            logger.info(
+                "asr_final empty call=%s lang=%s empty_count=%d draft_state=%s",
+                self.call_id,
+                lang,
+                self._asr_empty_count,
+                self.draft.state.value,
+            )
             await self._emit("asr.final", {"text": "", "empty": True})
             self.vad.reset()
             self._partial_text = ""
             self._barge_buffer.clear()
             if self.business_mode == "repair_order":
-                plan = self.dialog.next_prompt(self.draft)
+                # Never replay a long dynamic confirmation after an empty ASR
+                # result. A short local prompt keeps the caller informed and
+                # avoids duplicate MiniMax audio on unstable cloud links.
+                plan = self.dialog.empty_input_reprompt(self.draft)
                 if self._asr is not None and not self._asr_is_ready():
                     self._pending_asr_reprompt = plan
                     self.state = SessionState.CONNECTING_ASR
@@ -699,6 +710,7 @@ class CallSession:
             self._latency = LatencyMetrics()
             return
 
+        self._asr_empty_count = 0
         if self.state in {SessionState.THINKING, SessionState.SPEAKING}:
             await self._handle_barge_in()
 

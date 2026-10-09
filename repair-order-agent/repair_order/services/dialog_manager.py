@@ -184,6 +184,21 @@ class DialogManager:
             expected_field="customer_name",
         )
 
+    def empty_input_reprompt(self, draft: RepairOrderDraft) -> ResponsePlan:
+        """Use a short local prompt when ASR returns no text during confirmation."""
+        if draft.state in {
+            OrderState.CONFIRMING_REPAIR,
+            OrderState.CONFIRMING_ADDRESS,
+            OrderState.CONFIRMING_ORDER,
+        }:
+            return ResponsePlan(
+                text=self._say(draft, "ask_confirm_yesno"),
+                prompt_id="ask_confirm_yesno",
+                dynamic=False,
+                expected_field=None,
+            )
+        return self.next_prompt(draft)
+
     def _apply_extract(
         self,
         call_id: str,

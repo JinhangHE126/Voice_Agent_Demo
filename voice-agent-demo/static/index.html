@@ -187,6 +187,7 @@
     let wantListen = false;
     let playbackDoneTimer = null;
     let playbackGeneration = 0;
+    let botGeneration = null;
     const playbackSources = new Set();
     const PLAYBACK_DONE_GRACE_MS = 450;
 
@@ -463,6 +464,7 @@
     }
 
     function resetTranscript() {
+      botGeneration = null;
       transcript.innerHTML =
         `<div class="hint">點開始後說話；停頓後會自動回覆。系統會追問缺漏的姓名/電話/維修內容。</div>`;
       el("routePill").textContent = "route: —";
@@ -472,6 +474,7 @@
       const t = ev.type;
       const d = ev.data || {};
       if (t === "session.started") {
+        botGeneration = null;
         el("modePill").textContent =
           `mode: ${d.mode} | biz:${d.business_mode || "faq"} | asr:${d.asr} tts:${d.tts}`;
         setState("listening");
@@ -489,20 +492,30 @@
         }
       } else if (t === "asr.final") {
         if (d.text) {
+          botGeneration = ev.generation_id;
           transcript.innerHTML =
             `<div class="user">你：${escapeHtml(d.text)}</div>` +
             `<div class="bot">助手：…</div>`;
         }
         setMetric("mAsr", d.empty ? null : null);
       } else if (t === "llm.first_token") {
+        if (botGeneration !== ev.generation_id) {
+          const bot = transcript.querySelector(".bot");
+          if (bot) bot.textContent = "助手：…";
+          botGeneration = ev.generation_id;
+        }
         setMetric("mLlm", d.latency_ms, 600);
         if (d.route) el("routePill").textContent = `route: ${d.route}`;
       } else if (t === "llm.delta") {
         const bot = transcript.querySelector(".bot");
         if (bot) {
-          const cur = bot.textContent.replace(/^助手：/, "");
+          const isCurrentGeneration = botGeneration === ev.generation_id;
+          const cur = isCurrentGeneration
+            ? bot.textContent.replace(/^助手：/, "")
+            : "";
           const next = (cur === "…" ? "" : cur) + (d.text || "");
           bot.textContent = "助手：" + next;
+          botGeneration = ev.generation_id;
         }
       } else if (t === "tts.first_audio") {
         setMetric("mTts", d.latency_ms, 1000);

@@ -10,6 +10,7 @@ from app.orchestrator import CallSession
 from app.services.llm_router import FAQMatcher, GradedLLMRouter
 from app.services.text_norm import detect_reply_lang, split_for_tts
 from app.vad import EnergyVAD
+from repair_order.domain.repair_order import OrderState
 
 
 def test_vad_detects_speech_and_end() -> None:
@@ -364,6 +365,42 @@ async def test_empty_asr_final_reprompts_current_repair_field() -> None:
         and event.data.get("prompt_id") == "ask_name"
         for event in events
     )
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_asr_final_does_not_replay_dynamic_confirmation() -> None:
+    events: list[ServerEvent] = []
+
+    async def emit(ev: ServerEvent) -> None:
+        events.append(ev)
+
+    session = CallSession(
+        emit=emit,
+        settings=Settings(
+            agent_mode="mock",
+            business_mode="repair_order",
+            input_denoise_enabled=False,
+        ),
+        call_id="empty-confirmation",
+    )
+    session.draft.state = OrderState.CONFIRMING_REPAIR
+    session.draft.repair_description = "电脑主机进水，无法开机"
+
+    await session._on_asr_final("", lang="yue")
+    for _ in range(20):
+        if any(event.type == "prompt.audio" for event in events):
+            break
+        await asyncio.sleep(0.01)
+
+    prompt_ids = [
+        event.data.get("prompt_id")
+        for event in events
+        if event.type == "prompt.audio"
+    ]
+    assert "ask_confirm_yesno" in prompt_ids
+    assert "confirm_repair" not in prompt_ids
+    assert session._asr_empty_count == 1
     await session.close()
 
 

@@ -30,6 +30,21 @@ def test_next_prompt_goes_to_confirm_when_all_fields_ready() -> None:
     assert "旺角弥敦道100号" in plan.text
 
 
+def test_empty_input_during_confirmation_uses_short_local_prompt() -> None:
+    manager = DialogManager()
+
+    for state in (
+        OrderState.CONFIRMING_REPAIR,
+        OrderState.CONFIRMING_ADDRESS,
+        OrderState.CONFIRMING_ORDER,
+    ):
+        draft = RepairOrderDraft(state=state)
+        plan = manager.empty_input_reprompt(draft)
+
+        assert plan.prompt_id == "ask_confirm_yesno"
+        assert plan.dynamic is False
+
+
 def test_process_user_text_collect_confirm_save() -> None:
     repo = OrderRepository()
     manager = DialogManager(repository=repo)
