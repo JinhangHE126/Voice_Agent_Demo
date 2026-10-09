@@ -95,6 +95,9 @@ class Settings(BaseSettings):
     vad_window_ms: int = 1200 # 看最近1.2秒里， 有多少帧被判断为有声音。窗口越大：判断更稳，但反应更慢。
     vad_window_min_voiced_ratio: float = 0.20 # 最近 1.2 秒里，有声帧占比如果低于 35%，提前结束本轮。
     min_speech_ms: int = 200 # 连续被判定为{有声音}的最小时间。
+    # Short confirmations such as “啱/对” need a lower start threshold.
+    # This override is used only while confirming repair/address/order.
+    vad_confirmation_min_speech_ms: int = 120
     barge_in_min_ms: int = 250
     barge_in_thinking_min_ms: int = 500
     barge_in_energy_ratio: float = 1.5

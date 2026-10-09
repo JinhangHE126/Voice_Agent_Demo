@@ -25,7 +25,7 @@ _REPAIR_ROOT = Path(__file__).resolve().parents[2] / "repair-order-agent"
 if str(_REPAIR_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPAIR_ROOT))
 
-from repair_order.domain.repair_order import RepairOrderDraft  # noqa: E402
+from repair_order.domain.repair_order import OrderState, RepairOrderDraft  # noqa: E402
 from repair_order.repositories.order_repository import OrderRepository  # noqa: E402
 from repair_order.services.dialog_manager import DialogManager  # noqa: E402
 
@@ -521,7 +521,26 @@ class CallSession:
         if self._asr:
             await self._asr.push_pcm16(pcm)
 
-        ev = self.vad.accept(pcm)
+        confirmation_mode = (
+            self.business_mode == "repair_order"
+            and self.draft.state
+            in {
+                OrderState.CONFIRMING_REPAIR,
+                OrderState.CONFIRMING_ADDRESS,
+                OrderState.CONFIRMING_ORDER,
+            }
+        )
+        if confirmation_mode:
+            ev = self.vad.accept(
+                pcm,
+                min_speech_ms=self.settings.vad_confirmation_min_speech_ms,
+                # Short “啱/对” replies should end by trailing silence. The
+                # long-window ratio is designed for normal multi-clause speech.
+                enable_window_endpoint=False,
+                report_short_candidate=True,
+            )
+        else:
+            ev = self.vad.accept(pcm)
         if ev["event"] == "speech_start":
             self._mark_asr_speech_start()
             now = time.perf_counter()
@@ -576,6 +595,17 @@ class CallSession:
                         )
                     )
                 )
+        elif ev["event"] == "speech_candidate_rejected":
+            logger.info(
+                "speech_candidate_rejected call=%s candidate_ms=%s required_ms=%s "
+                "energy=%.1f threshold=%.1f confirmation_mode=%s",
+                self.call_id,
+                ev.get("candidate_ms"),
+                ev.get("required_ms"),
+                float(ev.get("energy") or 0.0),
+                float(ev.get("threshold") or 0.0),
+                confirmation_mode,
+            )
 
     async def force_end_utterance(self) -> None:
         if self._call_completed or self.state == SessionState.COMPLETED:
@@ -1156,6 +1186,18 @@ class CallSession:
                 # Browser may report done too early when streamed chunks arrive
                 # with jitter. Ignore premature completion and wait.
                 return
+        playback_ms = (
+            (time.perf_counter() - self._speaking_started_at) * 1000.0
+            if self._speaking_started_at is not None
+            else None
+        )
+        logger.info(
+            "playback_done call=%s generation=%s playback_ms=%s draft_state=%s",
+            self.call_id,
+            generation_id,
+            f"{playback_ms:.1f}" if playback_ms is not None else "-",
+            self.draft.state.value,
+        )
         self._awaiting_playback_done = False
         if self._call_completed:
             await self._enter_completed()

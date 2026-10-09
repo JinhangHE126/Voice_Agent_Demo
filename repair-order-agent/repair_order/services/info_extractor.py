@@ -652,6 +652,12 @@ def _llm_messages(text: str, expected_field: str | None) -> list[dict[str, str]]
             f"\n当前系统正在等待字段: {expected_field}。"
             "若用户只回答该字段，请优先填写它；另一字段保持 null。"
         )
+    elif expected_field == "confirmation":
+        hint = (
+            "\n当前用户正在回答确认问题。"
+            "只有用户明确提供了新的维修内容或地址时才抽取；"
+            "普通确认、否认或无意义识别结果必须保持 null。"
+        )
     elif expected_field:
         hint = (
             f"\n当前系统正在等待字段: {expected_field}。"
@@ -1516,6 +1522,18 @@ def _rules_are_sufficient(
         return True
     if _is_low_information_utterance(text):
         return True
+
+    if expected_field == "confirmation":
+        # Confirmation noise or ASR gibberish must not incur a network call.
+        # Still allow explicit repair/address corrections to use DeepSeek.
+        correction_markers = (
+            _ADDRESS_MARKERS
+            + _REPAIR_MARKERS
+            + _REPAIR_FAULT_MARKERS
+            + _REPAIR_DEVICE_MARKERS
+            + _REPAIR_CAUSE_MARKERS
+        )
+        return not any(marker in text for marker in correction_markers)
 
     # Name/phone are rule-owned. Never call the extract LLM for them.
     if expected_field in {"customer_name", "customer_phone"}:

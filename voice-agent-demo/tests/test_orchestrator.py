@@ -32,6 +32,40 @@ def test_vad_detects_speech_and_end() -> None:
     assert "speech_end" in events
 
 
+def test_vad_confirmation_override_accepts_short_reply() -> None:
+    vad = EnergyVAD(
+        silence_ms=60,
+        min_speech_ms=200,
+        frame_ms=20,
+        energy_threshold=100,
+        webrtc_mode=None,
+    )
+    loud = b"\x00\x10" * 320
+    quiet = b"\x00\x00" * 320
+
+    events = [
+        vad.accept(
+            loud,
+            min_speech_ms=120,
+            enable_window_endpoint=False,
+            report_short_candidate=True,
+        )["event"]
+        for _ in range(6)
+    ]
+    events.extend(
+        vad.accept(
+            quiet,
+            min_speech_ms=120,
+            enable_window_endpoint=False,
+            report_short_candidate=True,
+        )["event"]
+        for _ in range(4)
+    )
+
+    assert "speech_start" in events
+    assert "speech_end" in events
+
+
 def test_faq_match_cantonese_hours(tmp_path) -> None:
     path = tmp_path / "faq.json"
     path.write_text(

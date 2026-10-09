@@ -71,16 +71,32 @@ class EnergyVAD:
         self._silence_ms = 0.0
         self._window_voiced.clear()
 
-    def accept(self, pcm16: bytes) -> dict:
+    def accept(
+        self,
+        pcm16: bytes,
+        *,
+        min_speech_ms: int | None = None,
+        enable_window_endpoint: bool = True,
+        report_short_candidate: bool = False,
+    ) -> dict:
         if not pcm16:
             return {"event": "none", "energy": 0.0}
         self._buffer.extend(pcm16[: len(pcm16) - (len(pcm16) % 2)])
         selected = {"event": "none", "energy": 0.0}
+        effective_min_speech_ms = max(
+            self.frame_ms,
+            self.min_speech_ms if min_speech_ms is None else int(min_speech_ms),
+        )
 
         while len(self._buffer) >= self._frame_bytes:
             frame = bytes(self._buffer[: self._frame_bytes])
             del self._buffer[: self._frame_bytes]
-            event = self._accept_frame(frame)
+            event = self._accept_frame(
+                frame,
+                min_speech_ms=effective_min_speech_ms,
+                enable_window_endpoint=enable_window_endpoint,
+                report_short_candidate=report_short_candidate,
+            )
             selected["energy"] = event["energy"]
             selected["threshold"] = event["threshold"]
             # Preserve state transitions if a browser packet contains several
@@ -90,13 +106,20 @@ class EnergyVAD:
             if event["event"] == "speech_start":
                 selected = event
             elif (
-                event["event"] == "speech_continue"
+                event["event"] in {"speech_continue", "speech_candidate_rejected"}
                 and selected["event"] == "none"
             ):
                 selected = event
         return selected
 
-    def _accept_frame(self, frame: bytes) -> dict:
+    def _accept_frame(
+        self,
+        frame: bytes,
+        *,
+        min_speech_ms: int,
+        enable_window_endpoint: bool,
+        report_short_candidate: bool,
+    ) -> dict:
         energy = self._rms(frame)
         web_speech = (
             self._webrtc.is_speech(frame, self.sample_rate)
@@ -131,7 +154,7 @@ class EnergyVAD:
                     "speech_ms": speech_ms,
                     "reason": "max_speech_ms",
                 }
-            if not self._in_speech and self._speech_ms >= self.min_speech_ms:
+            if not self._in_speech and self._speech_ms >= min_speech_ms:
                 self._in_speech = True
                 return {
                     "event": "speech_start",
@@ -147,7 +170,10 @@ class EnergyVAD:
             return {"event": "none", "energy": energy, "threshold": threshold}
 
         if self._in_speech:
-            if len(self._window_voiced) == self._window_voiced.maxlen:
+            if (
+                enable_window_endpoint
+                and len(self._window_voiced) == self._window_voiced.maxlen
+            ):
                 voiced_ratio = sum(self._window_voiced) / len(self._window_voiced)
                 if voiced_ratio < self.window_min_voiced_ratio:
                     speech_ms = round(self._speech_ms)
@@ -177,7 +203,16 @@ class EnergyVAD:
                 "threshold": threshold,
             }
 
+        candidate_ms = round(self._speech_ms)
         self._speech_ms = 0.0
+        if report_short_candidate and candidate_ms >= self.frame_ms * 3:
+            return {
+                "event": "speech_candidate_rejected",
+                "energy": energy,
+                "threshold": threshold,
+                "candidate_ms": candidate_ms,
+                "required_ms": min_speech_ms,
+            }
         return {"event": "none", "energy": energy, "threshold": threshold}
 
     @staticmethod

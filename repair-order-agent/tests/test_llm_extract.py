@@ -140,6 +140,24 @@ def test_confirming_unknown_short_reply_still_skips_llm(monkeypatch) -> None:
     assert called["n"] == 0
 
 
+def test_confirmation_asr_gibberish_skips_llm(monkeypatch) -> None:
+    called = {"n": 0}
+
+    def _fake_llm(text: str, *, expected_field: str | None = None):
+        called["n"] += 1
+        return {"repair_description": "不应调用"}
+
+    monkeypatch.setattr(ie, "_llm_extract", _fake_llm)
+    monkeypatch.setenv("REPAIR_ORDER_USE_LLM_EXTRACTOR", "1")
+
+    out = extract_info(
+        "Let the. Let the. Wait.",
+        expected_field="confirmation",
+    )
+    assert out.is_confirm is False
+    assert called["n"] == 0
+
+
 def test_confirming_address_correction_still_calls_llm(monkeypatch) -> None:
     called = {"n": 0}
 

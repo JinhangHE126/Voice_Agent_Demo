@@ -57,6 +57,18 @@ def _standalone_title(text: str) -> str | None:
     }.get(compact)
 
 
+def _expected_field_for_turn(draft: RepairOrderDraft) -> str | None:
+    if draft.awaiting_field == "customer_name_title":
+        return "customer_name"
+    if draft.state in {
+        OrderState.CONFIRMING_REPAIR,
+        OrderState.CONFIRMING_ADDRESS,
+        OrderState.CONFIRMING_ORDER,
+    }:
+        return "confirmation"
+    return draft.awaiting_field
+
+
 class DialogManager:
     _FIELD_PRIORITY = (
         "customer_name",
@@ -419,11 +431,7 @@ class DialogManager:
         title_turn = self._apply_name_title_reply(draft, user_text)
         if title_turn is not None:
             return title_turn
-        expected_field = (
-            "customer_name"
-            if draft.awaiting_field == "customer_name_title"
-            else draft.awaiting_field
-        )
+        expected_field = _expected_field_for_turn(draft)
         extracted = extract_info(user_text, expected_field=expected_field)
         return self._apply_extract(call_id, draft, extracted)
 
@@ -436,11 +444,7 @@ class DialogManager:
         title_turn = self._apply_name_title_reply(draft, user_text)
         if title_turn is not None:
             return title_turn
-        expected_field = (
-            "customer_name"
-            if draft.awaiting_field == "customer_name_title"
-            else draft.awaiting_field
-        )
+        expected_field = _expected_field_for_turn(draft)
         extracted = await extract_info_async(
             user_text, expected_field=expected_field
         )
