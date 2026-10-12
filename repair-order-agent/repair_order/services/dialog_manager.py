@@ -30,6 +30,24 @@ def _clean_repair_text(text: str | None) -> str:
     return (text or "").strip().rstrip("，。,.!！?？；; ")
 
 
+def _merge_repair_descriptions(existing: str | None, incoming: str | None) -> str:
+    """Merge a short confirmation-stage supplement into the current repair draft."""
+    current = _clean_repair_text(existing)
+    update = _clean_repair_text(incoming)
+    if not current:
+        return update
+    if not update:
+        return current
+    if update in current:
+        return current
+    if current in update:
+        return update
+    # Short additive turns such as “然后它还进了很多水”.
+    if len(update) <= 24:
+        return f"{current}，{update}"
+    return update
+
+
 def _standalone_title(text: str) -> str | None:
     compact = re.sub(r"[\s，。,.!！?？、]+", "", text)
     for prefix in ("我是", "我係", "叫我", "称呼我", "稱呼我"):
@@ -235,9 +253,20 @@ class DialogManager:
                 updated_fields.append("customer_address")
         if extracted.repair_description:
             if conf_ok("repair", 0.75):
-                draft.repair_description = _clean_repair_text(
-                    extracted.repair_description
-                )
+                incoming = _clean_repair_text(extracted.repair_description)
+                if (
+                    draft.state
+                    in {
+                        OrderState.CONFIRMING_REPAIR,
+                        OrderState.CONFIRMING_ORDER,
+                    }
+                    and draft.repair_description
+                ):
+                    draft.repair_description = _merge_repair_descriptions(
+                        draft.repair_description, incoming
+                    )
+                else:
+                    draft.repair_description = incoming
                 draft.repair_confirmed = False
                 updated_fields.append("repair_description")
 
@@ -254,8 +283,24 @@ class DialogManager:
                 draft.language_confidence = extracted.lang_confidence
 
         if draft.state == OrderState.CONFIRMING_REPAIR:
-            if extracted.is_confirm and draft.repair_description:
+            # Pure confirm only when the user did not also rewrite repair details.
+            if (
+                extracted.is_confirm
+                and draft.repair_description
+                and "repair_description" not in updated_fields
+            ):
                 draft.repair_confirmed = True
+                draft.state = OrderState.COLLECTING
+                draft.awaiting_field = None
+                return TurnResult(
+                    plan=self.next_prompt(draft),
+                    updated_fields=updated_fields,
+                    phone_candidate=extracted.phone_candidate,
+                    phone_error=extracted.phone_error,
+                )
+            if "repair_description" in updated_fields:
+                # Supplement or correction: keep the new text and re-confirm.
+                draft.repair_confirmed = False
                 draft.state = OrderState.COLLECTING
                 draft.awaiting_field = None
                 return TurnResult(
@@ -267,8 +312,7 @@ class DialogManager:
             if extracted.is_deny:
                 draft.repair_confirmed = False
                 draft.state = OrderState.COLLECTING
-                if "repair_description" not in updated_fields:
-                    draft.repair_description = None
+                draft.repair_description = None
                 draft.awaiting_field = "repair_description"
                 return TurnResult(
                     plan=self.next_prompt(draft),

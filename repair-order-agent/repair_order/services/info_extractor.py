@@ -387,12 +387,48 @@ _REPAIR_CAUSE_MARKERS = (
     "進了水",
     "进了点水",
     "進了點水",
+    "进了很多水",
+    "進了很多水",
+    "进好多水",
     "入水",
     "入咗水",
     "受潮",
     "摔",
     "跌",
     "撞",
+)
+_REPAIR_SOFT_HINTS = (
+    "进了",
+    "進了",
+    "入水",
+    "清洗",
+    "灰尘",
+    "灰塵",
+    "清灰",
+    "没声音",
+    "沒有聲音",
+    "冇声音",
+    "冇聲音",
+    "打不开",
+    "打唔开",
+    "无法开机",
+    "無法開機",
+)
+_REPAIR_ACTION_MARKERS = (
+    "清洗",
+    "灰尘",
+    "灰塵",
+    "清灰",
+)
+_REPAIR_WATER_RE = re.compile(
+    r"(?:不小心)?(?:进|進|入)了?(?:一点|一點|啲|很多|好多|大量)?水"
+)
+_REPAIR_SCAFFOLD_RE = re.compile(
+    r"^(?:(?:嗯|呃|额|哎|唉|好|对|對|对的|對的)+"
+    r"[\s，。,.!！?？]*)*"
+    r"(?:(?:不|唔)?(?:对|對|啱|係|是)(?:的|啊|呀|啦|喇)?[\s，。,.!！?？]*)*"
+    r"(?:(?:维)?维修|維修)(?:的|嘅)?(?:东西|東西|内容|內容|问题|問題)?"
+    r"(?:是|係|为|為)?\s*"
 )
 _REPAIR_REACTION_ONLY_MARKERS = (
     "不敢动",
@@ -479,8 +515,10 @@ _LLM_EXTRACTOR_PROMPT = (
     "规则：\n"
     "1. 无法确定时该字段必须是 null，对应 evidence 也是 null。\n"
     "2. 禁止猜测、补写、改写地址中的数字/楼层/房号。\n"
-    "3. repair_description 必须保留原文中每一个独立故障、原因、危险现象和当前状态；"
-    "不得为了简短而遗漏任何一项，只去掉寒暄与“帮我修一下”等脚手架。\n"
+    "3. repair_description 必须保留原文中每一个独立故障、原因、危险现象、处理需求和当前状态；"
+    "例如“进了很多水/清洗灰尘/打不开/耳机没声音”都要保留，"
+    "不得为了简短而只留“电脑主机坏了”这类笼统句；"
+    "只去掉寒暄与“帮我修一下/维修的东西是/不对”等脚手架。\n"
     "4. customer_address 只保留地址本身，必须去掉寒暄与口语脚手架："
     "例如“哎/好/嗯/喂”、“我住/我住在”、“地址是/住址在/我的地址是”等；"
     "不要把整句用户原话原样写入地址。\n"
@@ -934,7 +972,27 @@ def _extract_repair(text: str) -> str | None:
         marker_text = marker_text.replace(phrase, "")
     if any(marker in marker_text for marker in _REPAIR_MARKERS):
         return stripped
+    if _REPAIR_WATER_RE.search(marker_text) or any(
+        hint in marker_text for hint in _REPAIR_SOFT_HINTS
+    ):
+        return stripped
     return None
+
+
+def _clean_repair_scaffold(text: str | None) -> str | None:
+    """Drop spoken correction scaffolds such as “不对，维修的东西是…”."""
+    candidate = (text or "").strip(" ，。,.!！?？")
+    if not candidate:
+        return None
+    candidate = candidate.replace("维维修", "维修").replace("維維修", "維修")
+    previous = None
+    while candidate and candidate != previous:
+        previous = candidate
+        candidate = _REPAIR_LEADING_FILLER_RE.sub("", candidate).strip(
+            " ，。,.!！?？"
+        )
+        candidate = _REPAIR_SCAFFOLD_RE.sub("", candidate).strip(" ，。,.!！?？")
+    return candidate or None
 
 
 def _standalone_name_valid(candidate: str) -> bool:
@@ -1300,11 +1358,7 @@ def _clean_repair_clause(text: str) -> str:
     )
     for filler in ("可能是", "可能係", "应该是", "應該係", "突然"):
         clause = clause.replace(filler, "")
-    clause = re.sub(
-        r"(?:不小心)?(?:进|進|入)了?(?:一点|一點|啲)?水",
-        "进水",
-        clause,
-    )
+    clause = _REPAIR_WATER_RE.sub("进水", clause)
     clause = clause.replace("打不开了", "打不开")
     clause = clause.replace("打唔开咗", "打唔开")
     return clause.strip(" ，。,.!！?？；; ")
@@ -1317,16 +1371,51 @@ def _repair_clause_score(clause: str) -> int:
         return 80
     if any(marker in clause for marker in _REPAIR_CAUSE_MARKERS):
         return 70
+    if _REPAIR_WATER_RE.search(clause):
+        return 70
+    if any(marker in clause for marker in _REPAIR_ACTION_MARKERS):
+        return 60
     if any(marker in clause for marker in _REPAIR_DEVICE_MARKERS):
         return 50
     return 0
 
 
-def _summarize_repair_text(text: str | None) -> str:
-    original = (text or "").strip(" ，。,.!！?？；; ")
-    original = _REPAIR_LEADING_FILLER_RE.sub("", original).strip(
-        " ，。,.!！?？；; "
+def _repair_fact_count(text: str | None) -> int:
+    value = text or ""
+    markers = (
+        _REPAIR_FAULT_MARKERS
+        + _REPAIR_CAUSE_MARKERS
+        + _REPAIR_HAZARD_MARKERS
+        + _REPAIR_DEVICE_MARKERS
+        + _REPAIR_ACTION_MARKERS
     )
+    count = sum(1 for marker in markers if marker in value)
+    if _REPAIR_WATER_RE.search(value) and "进水" not in value and "進水" not in value:
+        count += 1
+    return count
+
+
+def _prefer_complete_repair(source: str, candidate: str | None) -> str | None:
+    """Prefer a coverage-complete repair summary over an over-compressed LLM result."""
+    rule = _summarize_repair_text(_clean_repair_scaffold(source))
+    cleaned_candidate = _clean_repair_scaffold(candidate)
+    cand = (
+        _summarize_repair_text(cleaned_candidate) if cleaned_candidate else None
+    )
+    if cand and _repair_valid(cand):
+        if not rule or not _repair_valid(rule):
+            return cand
+        if _repair_fact_count(rule) > _repair_fact_count(cand):
+            return rule
+        return cand
+    if rule and _repair_valid(rule):
+        return rule
+    return cand
+
+
+def _summarize_repair_text(text: str | None) -> str:
+    original = _clean_repair_scaffold(text) or ""
+    original = original.strip(" ，。,.!！?？；; ")
     if len(original) <= 24:
         return original
 
@@ -1340,6 +1429,8 @@ def _summarize_repair_text(text: str | None) -> str:
         request_only = (
             any(x in clause for x in ("维修", "維修", "修一下", "整一下"))
             and not any(x in clause for x in _REPAIR_FAULT_MARKERS)
+            and not any(x in clause for x in _REPAIR_ACTION_MARKERS)
+            and not _REPAIR_WATER_RE.search(clause)
         )
         if request_only:
             continue
@@ -1384,9 +1475,9 @@ def _apply_expected_field_fallback(
         if _address_valid(cleaned):
             result.customer_address = cleaned
     elif expected_field == "repair_description" and not result.repair_description:
-        cleaned = _REPAIR_LEADING_FILLER_RE.sub("", stripped).strip(" ，。,.!！?？")
-        if 2 <= len(cleaned) <= 80 and _repair_valid(cleaned):
-            result.repair_description = cleaned
+        preferred = _prefer_complete_repair(text, stripped)
+        if preferred and _repair_valid(preferred):
+            result.repair_description = preferred
     return result
 
 
@@ -1445,14 +1536,13 @@ def _apply_llm_obj(
             result.evidence["address"] = snippets[0] if snippets else candidate
 
     if repair:
-        candidate = str(repair).strip()
-        candidate = _REPAIR_LEADING_FILLER_RE.sub("", candidate).strip(
-            " ，。,.!！?？"
-        )
+        candidate = _clean_repair_scaffold(str(repair))
         if candidate and _grounded_in_source(candidate, repair_evidence, normalized):
-            result.repair_description = candidate
-            snippets = _evidence_snippets(repair_evidence)
-            result.evidence["repair"] = snippets[0] if snippets else candidate
+            preferred = _prefer_complete_repair(normalized, candidate)
+            if preferred:
+                result.repair_description = preferred
+                snippets = _evidence_snippets(repair_evidence)
+                result.evidence["repair"] = snippets[0] if snippets else preferred
 
     conf = _normalize_conf(llm_obj.get("confidence"))
     for key in ("repair", "address"):
@@ -1511,12 +1601,14 @@ def _finalize_extract(
         result.customer_address = _clean_address_text(result.customer_address)
         if not _address_valid(result.customer_address):
             result.customer_address = None
-    if result.repair_description and not _repair_valid(result.repair_description):
-        result.repair_description = None
-    elif result.repair_description:
-        result.repair_description = _summarize_repair_text(
-            result.repair_description
+    if result.repair_description:
+        preferred = _prefer_complete_repair(
+            normalized, result.repair_description
         )
+        if preferred and _repair_valid(preferred):
+            result.repair_description = preferred
+        else:
+            result.repair_description = None
 
     if "phone" not in result.confidence and result.customer_phone:
         result.confidence["phone"] = 0.85
@@ -1571,7 +1663,10 @@ def _rules_are_sufficient(
             + _REPAIR_FAULT_MARKERS
             + _REPAIR_DEVICE_MARKERS
             + _REPAIR_CAUSE_MARKERS
+            + _REPAIR_SOFT_HINTS
         )
+        if _REPAIR_WATER_RE.search(text or ""):
+            return False
         return not any(marker in text for marker in correction_markers)
 
     # Name/phone are rule-owned. Never call the extract LLM for them.

@@ -371,6 +371,53 @@ def test_repair_strips_leading_hao_filler() -> None:
     assert "电脑主机坏了" in out.repair_description
 
 
+def test_repair_keeps_water_and_cleaning_details() -> None:
+    out = extract_info(
+        "好，我的电脑主机坏了，需要去清洗一下灰尘，它昨天进了很多水。",
+        expected_field="repair_description",
+    )
+    repair = out.repair_description or ""
+    assert "电脑主机" in repair or "主机" in repair
+    assert "进水" in repair or "进了很多水" in repair
+    assert "清洗" in repair or "灰尘" in repair
+
+
+def test_repair_correction_strips_denial_scaffold() -> None:
+    out = extract_info(
+        "嗯，不对，维维修的东西是他电脑主机坏了，他进了很多水。",
+        expected_field="confirmation",
+    )
+    repair = out.repair_description or ""
+    assert repair
+    assert not repair.startswith("不对")
+    assert "维维修" not in repair
+    assert "维修的东西是" not in repair
+    assert "电脑主机" in repair
+    assert "进水" in repair or "进了很多水" in repair
+
+
+def test_confirming_repair_merges_short_supplement() -> None:
+    manager = DialogManager()
+    draft = RepairOrderDraft(
+        customer_name="何先生",
+        repair_description="电脑主机坏了",
+        state=OrderState.CONFIRMING_REPAIR,
+    )
+
+    turn = manager.process_user_text(
+        "repair-supplement",
+        draft,
+        "对对，然后它还进了很多水。",
+    )
+
+    assert draft.repair_confirmed is False
+    assert "电脑主机坏了" in (draft.repair_description or "")
+    assert "进水" in (draft.repair_description or "") or "进了很多水" in (
+        draft.repair_description or ""
+    )
+    assert turn.plan.prompt_id == "confirm_repair"
+
+
 def test_copula_in_information_is_not_confirmation() -> None:
     assert extract_info("电话係91234567").is_confirm is False
     assert extract_info("问题係冷气唔冻").is_confirm is False
