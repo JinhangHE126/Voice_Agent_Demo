@@ -130,6 +130,13 @@ _PHONE_FUZZY_DIGIT_MAP = {
     "够": "9",
     "夠": "9",
 }
+# 地址里的口述数字映射：标准中文数字 + 电话口述词。仅在「连续 ≥2 个
+# 数字词」的序列内启用（见 _normalize_address_digits），避免把「九龙/
+# 九座/公园」这类地名或单位里的单个数字词误归一化。
+_ADDRESS_DIGIT_MAP = {
+    **_CN_DIGIT_MAP,
+    **_PHONE_FUZZY_DIGIT_MAP,
+}
 _PHONE_SPOKEN_SEPARATORS = set(" \t\r\n，。,.!！?？、-—")
 _PHONE_LEADING_FILLER_RE = re.compile(
     r"^\s*(?:(?:呃|额|嗯|哎|唉|喂|好)[\s，。,.!！?？、]*)+",
@@ -454,6 +461,7 @@ _ADDRESS_PREFIX_RE = re.compile(
     r"^(?:我的?)?(?:维修|維修)?(?:地址|住址|地点|地點)"
     r"(?:係|是|在|为|為)?\s*[:：]?\s*"
     r"|^(?:我)?(?:住在|住喺|住)\s*"
+    r"|^(?:我们|我們|我)(?:是在|就在|在|係)\s*"
 )
 
 _SOCIAL_ONLY_TOKENS = (
@@ -1120,6 +1128,56 @@ def _detect_lang(text: str) -> tuple[str, float]:
     return "cmn", 0.4
 
 
+def _normalize_address_digits(text: str | None) -> str | None:
+    """把地址里连续的口述数字序列归一化为阿拉伯数字。
+
+    只转换由 ≥2 个连续数字词组成的序列（阿拉伯数字 + 标准中文数字 +
+    电话口述词），例如「九幺幺C室」→「911C室」、「九座九幺幺」→「九座911」。
+    单个数字词（如「九龙」「九座」「九楼」「公园」）保持不变，避免把
+    地名、单位或普通词汇误归一化。
+    """
+    if not text:
+        return text
+
+    out: list[str] = []
+    buf: list[str] = []
+
+    def flush() -> None:
+        if len(buf) >= 2:
+            digits = "".join(_ADDRESS_DIGIT_MAP.get(ch, ch) for ch in buf)
+            out.append(digits)
+        else:
+            out.extend(buf)
+        buf.clear()
+
+    for ch in text:
+        if ch.isdigit() or ch in _ADDRESS_DIGIT_MAP:
+            buf.append(ch)
+        else:
+            flush()
+            out.append(ch)
+    flush()
+    return "".join(out)
+
+
+# 确认阶段用户常在报地址前先说「对/是/呃/嗯」等确认词，这些属于脚手架，
+# 不应进入落库地址。只在 expected_field == "confirmation" 时启用。
+_ADDRESS_CONFIRM_SCAFFOLD_RE = re.compile(
+    r"^(?:(?:对|對|是|係|系|呃|额|哎|唉|嗯|啊|呀|哦|噢|啱)"
+    r"[呀啊哦喔]*[\s，。,.!！?？、]*)+"
+)
+
+
+def _strip_confirmation_address_scaffold(text: str | None) -> str | None:
+    if not text:
+        return text
+    previous = None
+    while text and text != previous:
+        previous = text
+        text = _ADDRESS_CONFIRM_SCAFFOLD_RE.sub("", text).strip(" ，。,.!！?？")
+    return text or None
+
+
 def _clean_address_text(text: str | None) -> str | None:
     """Keep only the address body; drop greetings and “我住/地址是” scaffolds."""
     candidate = (text or "").strip(" ，。,.!！?？")
@@ -1130,6 +1188,7 @@ def _clean_address_text(text: str | None) -> str | None:
     while candidate and candidate != previous:
         previous = candidate
         candidate = _ADDRESS_PREFIX_RE.sub("", candidate).strip(" ，。,.!！?？")
+    candidate = _normalize_address_digits(candidate)
     return candidate or None
 
 
@@ -1275,6 +1334,13 @@ def _is_confirm_utterance(text: str) -> bool:
     while remainder:
         matched = next((token for token in repeatable if remainder.startswith(token)), None)
         if matched is None:
+            # ASR 常把「对，对的」里的逗号识别成句号，导致去标点后
+            # 「对对」粘连（如「对。对的，对的。」→「对对的对的」）。
+            # 剥离单个「对/對」后继续匹配，避免整轮漏判。
+            if remainder.startswith(("对", "對")):
+                remainder = remainder[1:]
+                consumed = True
+                continue
             break
         consumed = True
         remainder = remainder[len(matched) :]
@@ -1599,6 +1665,10 @@ def _finalize_extract(
         result.customer_phone = None
     if result.customer_address:
         result.customer_address = _clean_address_text(result.customer_address)
+        if expected_field == "confirmation":
+            result.customer_address = _strip_confirmation_address_scaffold(
+                result.customer_address
+            )
         if not _address_valid(result.customer_address):
             result.customer_address = None
     if result.repair_description:
@@ -1655,8 +1725,12 @@ def _rules_are_sufficient(
         return True
 
     if expected_field == "confirmation":
+        # 地址纠错：规则已成功抽到地址（含口述数字归一化）即可短路，
+        # 不再为「九幺幺→911」这类归一化打一次跨境 LLM。
+        if result.customer_address:
+            return True
         # Confirmation noise or ASR gibberish must not incur a network call.
-        # Still allow explicit repair/address corrections to use DeepSeek.
+        # Still allow explicit repair corrections to use DeepSeek.
         correction_markers = (
             _ADDRESS_MARKERS
             + _REPAIR_MARKERS
@@ -1684,6 +1758,9 @@ def _rules_are_sufficient(
 
     # repair / address turns: prefer DeepSeek for record quality.
     if expected_field in _LLM_FIELDS:
+        # 地址：规则抽到（含口述数字归一化）即可短路，省一次跨境 LLM。
+        if expected_field == "customer_address" and result.customer_address:
+            return True
         return False
 
     # Confirming / free-form (expected_field is None): skip DeepSeek unless the

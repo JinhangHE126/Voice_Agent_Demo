@@ -35,6 +35,11 @@ PROMPTS: dict[str, str] = {
     "please_wait_asr": "收到，等我一下。",
     "connecting_asr": "正在帮你接通，请稍等一下。",
     "asr_unavailable": "唔好意思，暂时未能接通，请稍后再试。",
+    # Short fillers played while field extraction (rules ± LLM) runs.
+    "ack_ok": "好嘅。",
+    "ack_got_it": "明白。",
+    "ack_checking": "我帮你确认一下。",
+    "ack_writing": "我记低先。",
 }
 
 

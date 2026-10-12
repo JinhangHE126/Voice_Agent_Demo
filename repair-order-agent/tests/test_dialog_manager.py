@@ -361,6 +361,26 @@ def test_address_strips_spoken_residence_prefix() -> None:
     assert "九龙半岛油尖旺区佐敦文苑街文苑楼" in out.customer_address
 
 
+def test_address_strips_wo_shi_zai_prefix() -> None:
+    out = extract_info(
+        "对，我是在香港九龙半岛油尖旺区佐敦吴苑街吴苑楼。",
+        expected_field="confirmation",
+    )
+    assert out.customer_address is not None
+    assert not out.customer_address.startswith("我是")
+    assert "香港九龙半岛油尖旺区佐敦吴苑街吴苑楼" in out.customer_address
+
+
+def test_address_strips_wo_men_zai_prefix() -> None:
+    out = extract_info(
+        "我们在香港九龙半岛酒店望去。",
+        expected_field="confirmation",
+    )
+    assert out.customer_address is not None
+    assert not out.customer_address.startswith("我们在")
+    assert "香港九龙半岛" in out.customer_address
+
+
 def test_repair_strips_leading_hao_filler() -> None:
     out = extract_info(
         "好，我电脑主机坏了，需要去清洗",
@@ -433,6 +453,8 @@ def test_short_cantonese_confirmation_still_works() -> None:
     assert extract_info("好的").is_confirm is True
     assert extract_info("对的对的，对的。对的对的。喂。").is_confirm is True
     assert extract_info("嗯，对的对的 。喂。").is_confirm is True
+    # ASR 把「对，对的」的逗号误识别成句号 → 去标点后「对对」粘连。
+    assert extract_info("对。对的，对的。").is_confirm is True
     assert extract_info("Yes, Nala.").is_confirm is True
     assert extract_info("就是。").is_confirm is True
     assert extract_info("就係。").is_confirm is True

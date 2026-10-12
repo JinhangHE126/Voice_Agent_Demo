@@ -20,10 +20,10 @@
 
 业务目标：多轮收集并落库：
 
-1. `repair_description`（维修内容）
-2. `customer_phone`（电话）
-3. `customer_address`（地址）
-4. `customer_name`（姓名）
+1. `customer_name`（姓名）
+2. `repair_description`（维修内容）
+3. `customer_phone`（电话）
+4. `customer_address`（地址）
 
 然后整句确认 → 写 SQLite → 结束语。
 
@@ -82,7 +82,7 @@
 3. `CallSession.start()`：
   - 建 ASR（`AGENT_MODE=cloud` 用 Qwen，否则 mock）
   - 预热 TTS
-  - 维修模式下立刻播 greeting，并设 `_greeting_uninterruptible = True`（开场期间麦克风音频直接丢弃）
+  - 维修模式下立刻播 greeting，并设 `_greeting_uninterruptible = True`（开场期间麦克风音频直接丢弃）；greeting 播完后立刻追问姓名（`name` 优先）
 4. 浏览器同时 `getUserMedia`：回声消除、降噪、AGC；PCM 降到 16k，二进制帧发到服务端。
 5. 前端收到 `tts.audio` 就播；播完发 `playback.done`，服务端回到 `LISTENING`，开始真正听用户。
 
@@ -256,7 +256,7 @@ VAD 事件：
 
 - 确定性状态机：`DialogManager`（不是自由聊天 LLM）
 - 状态：`COLLECTING → CONFIRMING → SAVING → COMPLETED`
-- 槽位优先级：`repair → phone → address → name`
+- 槽位优先级：`name → repair → phone → address`
 
 **策略逻辑**
 
@@ -401,7 +401,7 @@ python scripts\run_web.py
 ### 字段优先级（死规则）
 
 ```text
-repair_description → customer_phone → customer_address → customer_name
+customer_name → repair_description → customer_phone → customer_address
 ```
 
 实现：`DialogManager._FIELD_PRIORITY`。
