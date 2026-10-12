@@ -886,6 +886,46 @@ class CallSession:
             force=force,
         )
 
+    async def _play_filler_loop(
+        self,
+        filler_id: str,
+        stop: asyncio.Event,
+        generation_id: int,
+    ) -> None:
+        """Loop a short filler until the real reply's first audio is ready.
+
+        Extraction and MiniMax TTS both take time; this keeps a short local
+        filler repeating so the caller never hears dead air, then stops the
+        moment the real reply starts producing audio.
+        """
+        try:
+            pcm = self.prompts.load_pcm16(filler_id, lang=self._prompt_lang())
+            duration_s = (
+                len(pcm) / (self.settings.sample_rate * 2)
+                if pcm
+                else 0.6  # fallback pacing when the local wav is unavailable
+            )
+            while True:
+                # Play at least once so the filler still fires even when the
+                # reply is ready almost immediately (synchronous paths/tests).
+                await self._play_prompt_id(
+                    filler_id,
+                    generation_id=generation_id,
+                    route="repair_filler",
+                    mark_latency=False,
+                )
+                if stop.is_set() or generation_id != self.generation_id:
+                    return
+                # Pace to the filler's actual playback length, but wake early
+                # when the real reply signals it is ready.
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=duration_s)
+                    return
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            raise
+
     async def _speak_text(
         self,
         reply_text: str,
@@ -897,11 +937,16 @@ class CallSession:
         saved: bool = False,
         prefer_local: bool = True,
         emit_turn_done: bool = True,
+        filler_stop: asyncio.Event | None = None,
     ) -> None:
         full_reply = reply_text
         try:
             used_local = False
             if prefer_local and prompt_id:
+                # Local wav is instant; stop the filler right before playing so
+                # the real prompt follows the current filler without a gap.
+                if filler_stop:
+                    filler_stop.set()
                 used_local = await self._play_prompt_id(
                     prompt_id,
                     generation_id=generation_id,
@@ -926,6 +971,9 @@ class CallSession:
                     )
 
                 async def on_first_audio() -> None:
+                    # Dynamic TTS is ready: stop the filler so real audio plays.
+                    if filler_stop:
+                        filler_stop.set()
                     await self._mark_first_audio(generation_id=generation_id)
 
                 async def on_audio_chunk(pcm: bytes) -> None:
@@ -1013,19 +1061,20 @@ class CallSession:
     async def _run_reply(self, user_text: str, *, generation_id: int) -> None:
         if self.business_mode == "repair_order":
             filler_id = self._choose_wait_filler(user_text)
+            filler_stop = asyncio.Event()
             filler_task: asyncio.Task | None = None
             if filler_id:
-                # Start filler immediately while LLM extraction runs.
+                # Start filler immediately while LLM extraction runs and keep
+                # looping until the real reply's first audio is ready.
                 # Do not mark first-audio / awaiting playback for the filler:
                 # it shares generation_id with the real reply, and an early
                 # playback.done would flip LISTENING↔SPEAKING while MiniMax
                 # is still streaming the confirmation sentence.
                 filler_task = asyncio.create_task(
-                    self._play_prompt_id(
+                    self._play_filler_loop(
                         filler_id,
-                        generation_id=generation_id,
-                        route="repair_filler",
-                        mark_latency=False,
+                        filler_stop,
+                        generation_id,
                     )
                 )
                 await self._emit(
@@ -1033,74 +1082,74 @@ class CallSession:
                     {"prompt_id": filler_id, "user_chars": len(user_text)},
                 )
 
-            turn_task = asyncio.create_task(
-                self.dialog.process_user_text_async(
+            try:
+                turn = await self.dialog.process_user_text_async(
                     self.call_id, self.draft, user_text
                 )
-            )
-            turn = await turn_task
-            self._reply_lang = self._reply_lang_for_tts()
+                self._reply_lang = self._reply_lang_for_tts()
 
-            if filler_task is not None:
-                try:
-                    await filler_task
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    pass
+                if generation_id != self.generation_id:
+                    return
 
-            if generation_id != self.generation_id:
+                await self._emit(
+                    "order.draft",
+                    {
+                        "customer_name": self.draft.customer_name,
+                        "customer_phone": self.draft.customer_phone,
+                        "customer_address": self.draft.customer_address,
+                        "repair_description": self.draft.repair_description,
+                        "repair_confirmed": self.draft.repair_confirmed,
+                        "address_confirmed": self.draft.address_confirmed,
+                        "state": self.draft.state.value,
+                        "awaiting_field": self.draft.awaiting_field,
+                        "session_language": self.draft.session_language,
+                        "language_source": self.draft.language_source,
+                        "language_confidence": self.draft.language_confidence,
+                        "phone_candidate": getattr(turn, "phone_candidate", None),
+                        "phone_error": getattr(turn, "phone_error", None),
+                        "updated_fields": turn.updated_fields or [],
+                        "saved": turn.saved,
+                    },
+                )
+                logger.info(
+                    "draft_update call=%s updated_fields=%s awaiting=%s state=%s "
+                    "name=%r phone=%r address=%r repair=%r repair_confirmed=%s "
+                    "address_confirmed=%s",
+                    self.call_id,
+                    turn.updated_fields or [],
+                    self.draft.awaiting_field,
+                    self.draft.state.value,
+                    self.draft.customer_name,
+                    self.draft.customer_phone,
+                    self.draft.customer_address,
+                    self.draft.repair_description,
+                    self.draft.repair_confirmed,
+                    self.draft.address_confirmed,
+                )
+                if turn.saved:
+                    # Stop accepting mic/ASR as soon as the order is persisted,
+                    # while still playing the completion prompt.
+                    self._call_completed = True
+                await self._speak_text(
+                    turn.plan.text,
+                    generation_id=generation_id,
+                    route="repair_order",
+                    prompt_id=turn.plan.prompt_id,
+                    user_text=user_text,
+                    saved=turn.saved,
+                    prefer_local=not turn.plan.dynamic,
+                    filler_stop=filler_stop,
+                )
                 return
-
-            await self._emit(
-                "order.draft",
-                {
-                    "customer_name": self.draft.customer_name,
-                    "customer_phone": self.draft.customer_phone,
-                    "customer_address": self.draft.customer_address,
-                    "repair_description": self.draft.repair_description,
-                    "repair_confirmed": self.draft.repair_confirmed,
-                    "address_confirmed": self.draft.address_confirmed,
-                    "state": self.draft.state.value,
-                    "awaiting_field": self.draft.awaiting_field,
-                    "session_language": self.draft.session_language,
-                    "language_source": self.draft.language_source,
-                    "language_confidence": self.draft.language_confidence,
-                    "phone_candidate": getattr(turn, "phone_candidate", None),
-                    "phone_error": getattr(turn, "phone_error", None),
-                    "updated_fields": turn.updated_fields or [],
-                    "saved": turn.saved,
-                },
-            )
-            logger.info(
-                "draft_update call=%s updated_fields=%s awaiting=%s state=%s "
-                "name=%r phone=%r address=%r repair=%r repair_confirmed=%s "
-                "address_confirmed=%s",
-                self.call_id,
-                turn.updated_fields or [],
-                self.draft.awaiting_field,
-                self.draft.state.value,
-                self.draft.customer_name,
-                self.draft.customer_phone,
-                self.draft.customer_address,
-                self.draft.repair_description,
-                self.draft.repair_confirmed,
-                self.draft.address_confirmed,
-            )
-            if turn.saved:
-                # Stop accepting mic/ASR as soon as the order is persisted,
-                # while still playing the completion prompt.
-                self._call_completed = True
-            await self._speak_text(
-                turn.plan.text,
-                generation_id=generation_id,
-                route="repair_order",
-                prompt_id=turn.plan.prompt_id,
-                user_text=user_text,
-                saved=turn.saved,
-                prefer_local=not turn.plan.dynamic,
-            )
-            return
+            finally:
+                filler_stop.set()
+                if filler_task is not None:
+                    try:
+                        await filler_task
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
 
         route_out: dict[str, str] = {}
         full_reply = ""

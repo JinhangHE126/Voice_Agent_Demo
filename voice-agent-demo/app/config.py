@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     # Maximum customer-facing silence while one utterance is finalized.
     dashscope_asr_hard_timeout_ms: int = 10000
     # Play a short local acknowledgement if ASR has not finalized by then.
-    asr_wait_prompt_delay_ms: int = 1300
+    asr_wait_prompt_delay_ms: int = 700
     # Very short turns with no ASR progress are reprompted instead of replayed.
     asr_short_utterance_ms: int = 500
     # Do not leave a caller waiting indefinitely during initial ASR setup.
