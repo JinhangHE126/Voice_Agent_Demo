@@ -1664,11 +1664,13 @@ def _finalize_extract(
     if result.customer_phone and not _is_valid_phone_digits(result.customer_phone):
         result.customer_phone = None
     if result.customer_address:
-        result.customer_address = _clean_address_text(result.customer_address)
+        # 先剥掉「对/是/呃」等确认脚手架，再清理「我是在/我们在」等前缀，
+        # 否则 _ADDRESS_PREFIX_RE 以 ^ 开头会因「对，」而匹配不到「我是在」。
         if expected_field == "confirmation":
             result.customer_address = _strip_confirmation_address_scaffold(
                 result.customer_address
             )
+        result.customer_address = _clean_address_text(result.customer_address)
         if not _address_valid(result.customer_address):
             result.customer_address = None
     if result.repair_description:
@@ -1725,10 +1727,6 @@ def _rules_are_sufficient(
         return True
 
     if expected_field == "confirmation":
-        # 地址纠错：规则已成功抽到地址（含口述数字归一化）即可短路，
-        # 不再为「九幺幺→911」这类归一化打一次跨境 LLM。
-        if result.customer_address:
-            return True
         # Confirmation noise or ASR gibberish must not incur a network call.
         # Still allow explicit repair corrections to use DeepSeek.
         correction_markers = (
@@ -1758,9 +1756,6 @@ def _rules_are_sufficient(
 
     # repair / address turns: prefer DeepSeek for record quality.
     if expected_field in _LLM_FIELDS:
-        # 地址：规则抽到（含口述数字归一化）即可短路，省一次跨境 LLM。
-        if expected_field == "customer_address" and result.customer_address:
-            return True
         return False
 
     # Confirming / free-form (expected_field is None): skip DeepSeek unless the

@@ -374,7 +374,7 @@ def test_address_strips_wo_shi_zai_prefix() -> None:
 def test_address_strips_wo_men_zai_prefix() -> None:
     out = extract_info(
         "我们在香港九龙半岛酒店望去。",
-        expected_field="confirmation",
+        expected_field="customer_address",
     )
     assert out.customer_address is not None
     assert not out.customer_address.startswith("我们在")

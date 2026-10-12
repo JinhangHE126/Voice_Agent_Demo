@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     business_mode: str = "repair_order"
     repair_order_sqlite_path: Path = ROOT_DIR / "output" / "repair_orders.sqlite"
     repair_order_use_llm_extractor: bool = True
-    repair_order_extract_timeout_s: float = 3.0
+    repair_order_extract_timeout_s: float = 5.0
     # deepseek | dashscope — structured extract for repair/address only
     repair_order_extract_provider: str = "deepseek"
     repair_order_extract_base_url: str = "https://api.deepseek.com"
@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     dashscope_asr_silence_ms: int = 300
     dashscope_asr_final_timeout_ms: int = 2500
     # Maximum customer-facing silence while one utterance is finalized.
-    dashscope_asr_hard_timeout_ms: int = 5000
+    dashscope_asr_hard_timeout_ms: int = 10000
     # Play a short local acknowledgement if ASR has not finalized by then.
     asr_wait_prompt_delay_ms: int = 1300
     # Very short turns with no ASR progress are reprompted instead of replayed.
