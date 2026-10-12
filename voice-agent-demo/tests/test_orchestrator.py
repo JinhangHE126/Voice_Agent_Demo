@@ -631,7 +631,7 @@ async def test_empty_final_waits_for_asr_before_reprompt() -> None:
 
 
 @pytest.mark.asyncio
-async def test_barge_in_preserves_vad_until_short_utterance_ends() -> None:
+async def test_speaking_ignores_user_audio_no_barge_in() -> None:
     events: list[ServerEvent] = []
 
     async def emit(ev: ServerEvent) -> None:
@@ -647,7 +647,7 @@ async def test_barge_in_preserves_vad_until_short_utterance_ends() -> None:
         vad_webrtc_mode=None,
         barge_in_min_ms=0,
     )
-    session = CallSession(emit=emit, settings=settings, call_id="barge-vad")
+    session = CallSession(emit=emit, settings=settings, call_id="no-barge")
 
     class FakeASR:
         def __init__(self) -> None:
@@ -669,18 +669,13 @@ async def test_barge_in_preserves_vad_until_short_utterance_ends() -> None:
     session._speaking_started_at = 0.0
 
     loud = b"\x00\x20" * 320
-    quiet = b"\x00\x00" * 320
     await session.on_pcm16(loud)
     await session.on_pcm16(loud)
-    assert session.state == SessionState.LISTENING
-    assert fake_asr.pushed
 
-    await session.on_pcm16(quiet)
-    await session.on_pcm16(quiet)
-    await asyncio.wait_for(fake_asr.end_called.wait(), timeout=0.5)
-
-    assert session.state == SessionState.ENDPOINTING
-    assert any(
+    # SPEAKING 期间客户语音被忽略：状态保持不变，音频不推给 ASR。
+    assert session.state == SessionState.SPEAKING
+    assert not fake_asr.pushed
+    assert not any(
         event.type == "speech.started" and event.data.get("barge_in")
         for event in events
     )

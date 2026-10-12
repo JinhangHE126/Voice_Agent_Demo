@@ -452,11 +452,8 @@ class CallSession:
             return
 
         if self.state in {SessionState.THINKING, SessionState.SPEAKING}:
-            # During THINKING, avoid false barge-in from room noise or speech
-            # tail, otherwise the pending reply gets canceled repeatedly.
-            if self.state == SessionState.THINKING:
-                return
-            self._barge_buffer.extend(pcm)
+            # THINKING / SPEAKING 期间均忽略客户语音：系统播完前不处理、不打断。
+            return
             max_bytes = self.settings.sample_rate * 2
             if len(self._barge_buffer) > max_bytes:
                 del self._barge_buffer[:-max_bytes]
