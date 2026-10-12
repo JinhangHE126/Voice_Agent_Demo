@@ -553,6 +553,9 @@ class ExtractResult:
     repair_description: str | None = None
     is_confirm: bool = False
     is_deny: bool = False
+    # True when the whole utterance is just a filler/acknowledgement ("好/嗯")
+    # with no actionable field content. Callers use this to keep listening.
+    low_information: bool = False
     intent: str = "other"
     fields_to_correct: list[str] = field(default_factory=list)
     lang: str = "yue"
@@ -1624,6 +1627,7 @@ def _finalize_extract(
 ) -> ExtractResult:
     lowered = normalized.lower()
 
+    result.low_information = _is_low_information_utterance(normalized)
     result.is_deny = any(word in lowered for word in _DENY_WORDS)
     result.is_confirm = (not result.is_deny) and _is_confirm_utterance(normalized)
     if result.intent == "other":

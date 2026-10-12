@@ -24,6 +24,10 @@ class TurnResult:
     updated_fields: list[str] | None = None
     phone_candidate: str | None = None
     phone_error: str | None = None
+    # True when the caller only said a filler/acknowledgement while we were
+    # collecting a field: the orchestrator should stay silent and keep
+    # listening instead of re-asking or advancing the state machine.
+    keep_listening: bool = False
 
 
 def _clean_repair_text(text: str | None) -> str:
@@ -481,6 +485,41 @@ class DialogManager:
             phone_error=extracted.phone_error,
         )
 
+    def _should_keep_listening(
+        self,
+        draft: RepairOrderDraft,
+        extracted,
+    ) -> bool:
+        # Never swallow a confirm/deny while the agent is asking for a yes/no.
+        if draft.state in {
+            OrderState.CONFIRMING_REPAIR,
+            OrderState.CONFIRMING_ADDRESS,
+            OrderState.CONFIRMING_ORDER,
+        }:
+            return False
+        # Only keep listening when the whole utterance was a filler/ack
+        # ("好/嗯/对") with no actionable field content. Note: "好/是/对/啱"
+        # are flagged as confirm words, but while we are COLLECTING an open
+        # field they are just fillers, so we deliberately do NOT exclude
+        # is_confirm here (confirmations are handled by the confirming-state
+        # guard above). Denials still pass through to be corrected.
+        if not extracted.low_information:
+            return False
+        if extracted.is_deny:
+            return False
+        if extracted.intent in {"set_language", "use_ani", "transfer"}:
+            return False
+        if any(
+            (
+                extracted.customer_name,
+                extracted.customer_phone,
+                extracted.customer_address,
+                extracted.repair_description,
+            )
+        ):
+            return False
+        return True
+
     def process_user_text(
         self,
         call_id: str,
@@ -492,6 +531,16 @@ class DialogManager:
             return title_turn
         expected_field = _expected_field_for_turn(draft)
         extracted = extract_info(user_text, expected_field=expected_field)
+        if self._should_keep_listening(draft, extracted):
+            return TurnResult(
+                plan=ResponsePlan(
+                    text="", prompt_id="", dynamic=False, expected_field=None
+                ),
+                keep_listening=True,
+                updated_fields=[],
+                phone_candidate=extracted.phone_candidate,
+                phone_error=extracted.phone_error,
+            )
         return self._apply_extract(call_id, draft, extracted)
 
     async def process_user_text_async(
@@ -507,6 +556,16 @@ class DialogManager:
         extracted = await extract_info_async(
             user_text, expected_field=expected_field
         )
+        if self._should_keep_listening(draft, extracted):
+            return TurnResult(
+                plan=ResponsePlan(
+                    text="", prompt_id="", dynamic=False, expected_field=None
+                ),
+                keep_listening=True,
+                updated_fields=[],
+                phone_candidate=extracted.phone_candidate,
+                phone_error=extracted.phone_error,
+            )
         return self._apply_extract(call_id, draft, extracted)
 
     def _apply_name_title_reply(

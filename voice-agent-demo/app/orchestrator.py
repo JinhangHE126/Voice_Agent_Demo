@@ -1092,6 +1092,20 @@ class CallSession:
                 if generation_id != self.generation_id:
                     return
 
+                if turn.keep_listening:
+                    # The caller only said a filler/ack ("好/嗯") while we were
+                    # collecting a field. Stay silent and keep listening instead
+                    # of re-asking (which would enter SPEAKING and drop their
+                    # follow-up address/repair audio).
+                    logger.info(
+                        "keep_listening call=%s user_text=%r",
+                        self.call_id,
+                        user_text,
+                    )
+                    self._finish_listening()
+                    await self._emit("state", {"state": self.state.value})
+                    return
+
                 await self._emit(
                     "order.draft",
                     {

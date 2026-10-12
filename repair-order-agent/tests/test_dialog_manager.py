@@ -14,6 +14,52 @@ def test_next_prompt_asks_name_first() -> None:
     assert plan.expected_field == "customer_name"
 
 
+def test_filler_only_utterance_keeps_listening_while_collecting() -> None:
+    manager = DialogManager()
+    # Collecting the address: a bare "好" is just a filler before the caller
+    # starts speaking the actual address, so we must not advance or re-ask.
+    draft = RepairOrderDraft(
+        customer_name="何先生",
+        customer_phone="51266237",
+        repair_description="电脑主机坏了",
+        repair_confirmed=True,
+        state=OrderState.COLLECTING,
+        awaiting_field="customer_address",
+    )
+
+    turn = manager.process_user_text(
+        call_id="call-b",
+        draft=draft,
+        user_text="好",
+    )
+    assert turn.keep_listening is True
+    assert turn.updated_fields == []
+    assert draft.customer_address is None
+    assert draft.awaiting_field == "customer_address"
+
+
+def test_confirm_yes_not_treated_as_filler() -> None:
+    manager = DialogManager()
+    # While confirming, "是/对/啱" is a real confirm and must never be swallowed.
+    draft = RepairOrderDraft(
+        customer_name="何先生",
+        customer_phone="51266237",
+        customer_address="沙田第一城",
+        repair_description="电脑主机坏了",
+        repair_confirmed=True,
+        address_confirmed=False,
+        state=OrderState.CONFIRMING_ADDRESS,
+    )
+
+    turn = manager.process_user_text(
+        call_id="call-c",
+        draft=draft,
+        user_text="是",
+    )
+    assert turn.keep_listening is False
+    assert draft.address_confirmed is True
+
+
 def test_next_prompt_goes_to_confirm_when_all_fields_ready() -> None:
     manager = DialogManager()
     draft = RepairOrderDraft(
