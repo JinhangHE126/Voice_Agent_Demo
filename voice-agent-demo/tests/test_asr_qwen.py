@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import pytest
 import websockets
@@ -177,6 +178,66 @@ async def test_qwen_asr_final_timeout_rotates_connection(monkeypatch) -> None:
     assert await asr.wait_until_ready(0.5)
     assert connect_calls == 2
     assert asr._ws is second
+
+    await asr.close()
+
+
+class StagnatingWebSocket(FakeWebSocket):
+    """Emits partials then goes silent, never sending a completed event."""
+
+    async def send(self, raw: str) -> None:
+        await super().send(raw)
+        payload = json.loads(raw)
+        if payload.get("type") == "input_audio_buffer.commit":
+            await self._messages.put(
+                json.dumps(
+                    {
+                        "type": "input_audio_buffer.committed",
+                        "item_id": "i1",
+                    }
+                )
+            )
+            await self._messages.put(
+                json.dumps(
+                    {
+                        "type": "conversation.item.input_audio_transcription.delta",
+                        "item_id": "i1",
+                        "delta": "我电脑主机坏了",
+                    }
+                )
+            )
+
+
+@pytest.mark.asyncio
+async def test_partial_stagnation_finalizes_before_hard_timeout(monkeypatch) -> None:
+    sock = StagnatingWebSocket()
+    finals: list[tuple[str, str]] = []
+
+    async def fake_connect(*args, **kwargs):
+        return sock
+
+    async def on_final(text: str, lang: str) -> None:
+        finals.append((text, lang))
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+
+    asr = QwenRealtimeASR(
+        api_key="test",
+        language="yue",
+        final_timeout_ms=500,
+        hard_timeout_ms=5000,
+        stagnation_ms=400,
+        on_final=on_final,
+    )
+    await asr.start()
+
+    started = time.monotonic()
+    await asr.end_utterance()
+    elapsed = time.monotonic() - started
+
+    # Partial was used as the final, well before the 5s hard timeout.
+    assert finals == [("我电脑主机坏了", "yue")]
+    assert elapsed < 2.0
 
     await asr.close()
 

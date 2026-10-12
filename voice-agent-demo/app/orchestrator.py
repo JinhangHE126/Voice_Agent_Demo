@@ -643,6 +643,7 @@ class CallSession:
                 silence_ms=self.settings.dashscope_asr_silence_ms,
                 final_timeout_ms=self.settings.dashscope_asr_final_timeout_ms,
                 hard_timeout_ms=self.settings.dashscope_asr_hard_timeout_ms,
+                stagnation_ms=self.settings.dashscope_asr_stagnation_ms,
                 on_partial=on_partial,
                 on_final=on_final,
             )

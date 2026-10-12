@@ -39,7 +39,10 @@ class Settings(BaseSettings):
     dashscope_asr_silence_ms: int = 300
     dashscope_asr_final_timeout_ms: int = 2500
     # Maximum customer-facing silence while one utterance is finalized.
-    dashscope_asr_hard_timeout_ms: int = 10000
+    dashscope_asr_hard_timeout_ms: int = 6000
+    # If the partial transcript stops growing for this long, finalize with the
+    # current partial instead of waiting out the hard timeout (cross-border lag).
+    dashscope_asr_stagnation_ms: int = 1500
     # Play a short local acknowledgement if ASR has not finalized by then.
     asr_wait_prompt_delay_ms: int = 700
     # Very short turns with no ASR progress are reprompted instead of replayed.

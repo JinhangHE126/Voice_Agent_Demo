@@ -96,6 +96,7 @@ class QwenRealtimeASR:
         silence_ms: int = 400,
         final_timeout_ms: int = 2500,
         hard_timeout_ms: int = 5000,
+        stagnation_ms: int = 1500,
         on_partial: PartialCallback | None = None,
         on_final: FinalCallback | None = None,
     ) -> None:
@@ -108,6 +109,7 @@ class QwenRealtimeASR:
         self.silence_ms = silence_ms
         self.final_timeout_ms = max(500, int(final_timeout_ms))
         self.hard_timeout_ms = max(self.final_timeout_ms, int(hard_timeout_ms))
+        self.stagnation_ms = max(300, int(stagnation_ms))
         self.on_partial = on_partial
         self.on_final = on_final
         self._ws = None
@@ -117,6 +119,7 @@ class QwenRealtimeASR:
         self._session_ready_event = asyncio.Event()
         self._last_final = ""
         self._partial = ""
+        self._partial_updated_at = 0.0
         self._final_dispatched = False
         self._dispatch_lock = asyncio.Lock()
         self._end_utterance_lock = asyncio.Lock()
@@ -663,6 +666,7 @@ class QwenRealtimeASR:
                         # Prefer cumulative when provided
                         if msg.get("transcript"):
                             self._partial = msg["transcript"]
+                        self._partial_updated_at = time.monotonic()
                         if self.on_partial:
                             await self.on_partial(self._partial)
                 elif event == "conversation.item.input_audio_transcription.completed":
@@ -1004,7 +1008,8 @@ class QwenRealtimeASR:
         # Customer-facing wait only. Do not sync-reconnect/replay here: that
         # path races the hard timeout and can kill a fresh handshake.
         # Short turns: final_timeout_ms (default 2.5s) then reprompt.
-        # Long turns: keep waiting on the original request until hard_timeout.
+        # Long turns: finalize early once the partial stops growing, so a lost
+        # final event doesn't strand the caller for the full hard timeout.
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             await self._expire_utterance(
@@ -1016,25 +1021,44 @@ class QwenRealtimeASR:
                 ),
             )
             return
-        try:
-            await asyncio.wait_for(
-                self._final_event.wait(),
-                timeout=remaining,
-            )
-        except asyncio.TimeoutError:
-            # A completed event can race the timeout boundary by a few
-            # milliseconds. Never tear down a connection after its final was
-            # already accepted and dispatched.
+
+        stagnated = False
+        stagnation_s = self.stagnation_ms / 1000.0
+        while True:
             if self._final_dispatched or self._final_event.is_set():
                 return
-            await self._expire_utterance(
-                turn_id,
-                reason=(
-                    "short_utterance_timeout"
-                    if fast_fail
-                    else "final_timeout"
-                ),
-            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if (
+                not fast_fail
+                and self._partial
+                and (time.monotonic() - self._partial_updated_at) >= stagnation_s
+            ):
+                stagnated = True
+                break
+            try:
+                await asyncio.wait_for(
+                    self._final_event.wait(),
+                    timeout=min(0.1, remaining),
+                )
+                return
+            except asyncio.TimeoutError:
+                continue
+
+        # A completed event can race the timeout boundary by a few
+        # milliseconds. Never tear down a connection after its final was
+        # already accepted and dispatched.
+        if self._final_dispatched or self._final_event.is_set():
+            return
+        await self._expire_utterance(
+            turn_id,
+            reason=(
+                "short_utterance_timeout"
+                if fast_fail
+                else ("partial_stagnation" if stagnated else "final_timeout")
+            ),
+        )
 
     async def end_utterance(self, *, fast_fail: bool = False) -> None:
         async with self._end_utterance_lock:
