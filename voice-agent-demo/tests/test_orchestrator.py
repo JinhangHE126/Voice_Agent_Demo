@@ -183,6 +183,66 @@ async def test_greeting_stays_uninterruptible_until_browser_playback_done() -> N
 
 
 @pytest.mark.asyncio
+async def test_auto_complete_playback_advances_without_browser_done() -> None:
+    """SIP-style sink: on_audio_out + auto_complete_playback, no playback.done."""
+    events: list[ServerEvent] = []
+    audio_chunks: list[bytes] = []
+
+    async def emit(ev: ServerEvent) -> None:
+        events.append(ev)
+
+    async def on_audio_out(pcm: bytes) -> None:
+        audio_chunks.append(pcm)
+
+    settings = Settings(
+        agent_mode="mock",
+        business_mode="repair_order",
+        input_denoise_enabled=False,
+        repair_order_use_llm_extractor=False,
+        playback_done_grace_ms=0,
+    )
+    session = CallSession(
+        emit=emit,
+        settings=settings,
+        call_id="auto-playback",
+        on_audio_out=on_audio_out,
+        auto_complete_playback=True,
+    )
+    # Short local prompts so the auto-complete wait stays sub-second in CI.
+    short_pcm = b"\x00\x10" * (settings.sample_rate // 5)  # 200ms
+    session.prompts.load_pcm16 = (  # type: ignore[method-assign]
+        lambda prompt_id, lang="yue": short_pcm
+    )
+
+    await session.start()
+
+    for _ in range(200):
+        if (
+            session.state == SessionState.LISTENING
+            and session._greeting_uninterruptible is False
+        ):
+            break
+        await asyncio.sleep(0.02)
+
+    assert session.state == SessionState.LISTENING
+    assert session._greeting_uninterruptible is False
+    assert audio_chunks, "on_audio_out should receive greeting/ask_name PCM"
+    assert sum(len(c) for c in audio_chunks) >= len(short_pcm)
+    assert any(
+        e.type == "turn.done" and e.data.get("route") == "repair_greeting"
+        for e in events
+    )
+    assert any(
+        e.type == "turn.done" and e.data.get("route") == "repair_ask_name"
+        for e in events
+    )
+    # Browser path still emits tts.audio for observability.
+    assert any(e.type == "tts.audio" for e in events)
+
+    await session.close()
+
+
+@pytest.mark.asyncio
 async def test_greeting_waits_for_asr_ready_before_listening() -> None:
     events: list[ServerEvent] = []
 

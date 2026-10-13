@@ -84,6 +84,11 @@ class Settings(BaseSettings):
 
     host: str = "127.0.0.1"
     port: int = 7862
+    # AudioSocket TCP server (Asterisk connects out to this).
+    audiosocket_host: str = "0.0.0.0"
+    audiosocket_port: int = 9092
+    # Pace outbound 8 kHz frames at realtime (20 ms). Tests may disable.
+    audiosocket_pace_audio: bool = True
     sample_rate: int = 16000
     frame_ms: int = 20
     input_denoise_enabled: bool = False

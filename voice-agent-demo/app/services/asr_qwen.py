@@ -660,12 +660,26 @@ class QwenRealtimeASR:
                         or ""
                     )
                     if text:
-                        self._partial = text if len(text) > len(self._partial) else (
-                            self._partial + text
-                        )
-                        # Prefer cumulative when provided
+                        # Qwen may deliver either cumulative `text`/`transcript`
+                        # or incremental `delta` chunks. Distinguish by overlap
+                        # instead of a length heuristic: a length comparison
+                        # breaks once a cumulative transcript of equal length is
+                        # appended, then every later chunk gets duplicated into
+                        # the fallback final.
                         if msg.get("transcript"):
-                            self._partial = msg["transcript"]
+                            # Explicit full transcript (completed-style).
+                            self._partial = text
+                        elif not self._partial:
+                            self._partial = text
+                        elif text.startswith(self._partial):
+                            # Cumulative update: full text so far.
+                            self._partial = text
+                        elif self._partial.endswith(text):
+                            # Duplicate / retransmitted delta already applied.
+                            pass
+                        else:
+                            # Genuine incremental delta.
+                            self._partial = self._partial + text
                         self._partial_updated_at = time.monotonic()
                         if self.on_partial:
                             await self.on_partial(self._partial)
@@ -1022,6 +1036,10 @@ class QwenRealtimeASR:
             )
             return
 
+        # Measure stagnation from commit time, not from the last streaming
+        # partial: a partial can go quiet while the caller is still talking,
+        # which must not count as "done" the instant we commit.
+        self._partial_updated_at = time.monotonic()
         stagnated = False
         stagnation_s = self.stagnation_ms / 1000.0
         while True:

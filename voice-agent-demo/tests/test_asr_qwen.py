@@ -242,6 +242,67 @@ async def test_partial_stagnation_finalizes_before_hard_timeout(monkeypatch) -> 
     await asr.close()
 
 
+class CumulativeDeltaWebSocket(FakeWebSocket):
+    """Some Qwen variants put the cumulative transcript in `delta` events."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._chunks = [
+            "不对，是我电脑主机坏了，它昨天晚上",
+            "不对，是我电脑主机坏了，它昨天晚上进了",
+            "不对，是我电脑主机坏了，它昨天晚上进了水",
+        ]
+
+    async def send(self, raw: str) -> None:
+        await super().send(raw)
+        payload = json.loads(raw)
+        if payload.get("type") == "input_audio_buffer.commit":
+            await self._messages.put(
+                json.dumps(
+                    {"type": "input_audio_buffer.committed", "item_id": "i1"}
+                )
+            )
+            for chunk in self._chunks:
+                await self._messages.put(
+                    json.dumps(
+                        {
+                            "type": "conversation.item.input_audio_transcription.delta",
+                            "item_id": "i1",
+                            "delta": chunk,
+                        }
+                    )
+                )
+
+
+@pytest.mark.asyncio
+async def test_cumulative_delta_is_not_duplicated(monkeypatch) -> None:
+    sock = CumulativeDeltaWebSocket()
+    finals: list[tuple[str, str]] = []
+
+    async def fake_connect(*args, **kwargs):
+        return sock
+
+    async def on_final(text: str, lang: str) -> None:
+        finals.append((text, lang))
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+
+    asr = QwenRealtimeASR(
+        api_key="test",
+        language="yue",
+        final_timeout_ms=500,
+        hard_timeout_ms=5000,
+        stagnation_ms=400,
+        on_final=on_final,
+    )
+    await asr.start()
+    await asr.end_utterance()
+
+    assert finals == [("不对，是我电脑主机坏了，它昨天晚上进了水", "yue")]
+
+    await asr.close()
+
+
 @pytest.mark.asyncio
 async def test_timeout_dispatches_fallback_before_old_socket_closes(
     monkeypatch,

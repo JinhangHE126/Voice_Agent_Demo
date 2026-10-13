@@ -30,6 +30,10 @@ from repair_order.repositories.order_repository import OrderRepository  # noqa: 
 from repair_order.services.dialog_manager import DialogManager  # noqa: E402
 
 EmitFn = Callable[[ServerEvent], Awaitable[None]]
+# Optional PCM sink for non-browser transports (e.g. AudioSocket). PCM is
+# always 16-bit LE mono at settings.sample_rate (16 kHz today).
+AudioOutFn = Callable[[bytes], Awaitable[None]]
+AudioFlushFn = Callable[[], Awaitable[None]]
 logger = logging.getLogger(__name__)
 
 
@@ -42,6 +46,11 @@ class CallSession:
     Qwen ASR → repair-order DialogManager (or graded LLM) → MiniMax TTS. 
 
     Target: EoU → first playable audio ≤ 1000ms (cloud path; mock proves wiring).
+
+    Transport notes:
+    - Browser: emit("tts.audio") + client playback.done (default).
+    - SIP/AudioSocket: pass on_audio_out + auto_complete_playback=True so the
+      session advances after outbound PCM is fully written (no browser).
     """
 
     def __init__(
@@ -49,10 +58,17 @@ class CallSession:
         emit: EmitFn,
         settings: Settings | None = None,
         call_id: str | None = None,
+        *,
+        on_audio_out: AudioOutFn | None = None,
+        on_audio_flush: AudioFlushFn | None = None,
+        auto_complete_playback: bool = False,
     ) -> None:
         self.settings = settings or get_settings()
         self.call_id = call_id or uuid.uuid4().hex[:12]
         self.emit = emit
+        self.on_audio_out = on_audio_out
+        self.on_audio_flush = on_audio_flush
+        self.auto_complete_playback = auto_complete_playback
 
         self.state = SessionState.IDLE
         self.turn_id = 0
@@ -92,6 +108,7 @@ class CallSession:
         self._first_audio_marked = False
         self._handling_final = False
         self._awaiting_playback_done = False
+        self._playback_pcm_bytes = 0
         self._barge_buffer = bytearray()
         self._barge_started_at: float | None = None
         self._last_tts_audio_at: float | None = None
@@ -335,6 +352,60 @@ class CallSession:
             self._run_asr_wait_prompt(generation_id)
         )
 
+    async def _deliver_audio(self, pcm: bytes) -> None:
+        """Fan out playable PCM to the transport sink and/or browser events."""
+        if not pcm:
+            return
+        if self.on_audio_out is not None:
+            await self.on_audio_out(pcm)
+        await self._emit(
+            "tts.audio",
+            {
+                "pcm16_b64": _b64(pcm),
+                "sample_rate": self.settings.sample_rate,
+            },
+        )
+        self._last_tts_audio_at = time.perf_counter()
+        # Only count bytes that belong to a turn waiting for playback.done.
+        # Fillers use mark_latency=False and must not inflate SIP wait time.
+        if self._first_audio_marked:
+            self._playback_pcm_bytes += len(pcm)
+
+    async def _maybe_auto_complete_playback(self, generation_id: int) -> None:
+        """SIP/non-browser: advance after outbound audio has been fully written.
+
+        Sleeps for the remaining playout duration so LISTENING does not start
+        while the caller is still hearing the previous prompt.
+        """
+        if not self.auto_complete_playback:
+            return
+        if (
+            generation_id != self.generation_id
+            or not self._awaiting_playback_done
+        ):
+            return
+        if self.on_audio_flush is not None:
+            await self.on_audio_flush()
+        duration_s = self._playback_pcm_bytes / (
+            self.settings.sample_rate * 2
+        )
+        elapsed_s = 0.0
+        if self._speaking_started_at is not None:
+            elapsed_s = time.perf_counter() - self._speaking_started_at
+        wait_s = max(0.0, duration_s - elapsed_s)
+        if wait_s > 0:
+            try:
+                await asyncio.wait_for(self._cancel.wait(), timeout=wait_s)
+                return
+            except asyncio.TimeoutError:
+                pass
+        if (
+            generation_id != self.generation_id
+            or not self._awaiting_playback_done
+        ):
+            return
+        await self.on_playback_done(generation_id, force=True)
+
     async def _emit_local_status_prompt(self, prompt_id: str) -> bool:
         pcm = self.prompts.load_pcm16(prompt_id, lang=self._prompt_lang())
         if not pcm:
@@ -347,13 +418,7 @@ class CallSession:
                 "bytes": len(pcm),
             },
         )
-        await self._emit(
-            "tts.audio",
-            {
-                "pcm16_b64": _b64(pcm),
-                "sample_rate": self.settings.sample_rate,
-            },
-        )
+        await self._deliver_audio(pcm)
         return True
 
     async def _run_asr_wait_prompt(self, generation_id: int) -> None:
@@ -777,6 +842,7 @@ class CallSession:
             return
         self._first_audio_marked = True
         self._awaiting_playback_done = True
+        self._playback_pcm_bytes = 0
         if self._turn_clock is not None:
             self._latency.tts_first_audio_ms = round(
                 (time.perf_counter() - self._turn_clock) * 1000, 1
@@ -816,14 +882,7 @@ class CallSession:
         # browser underruns caused by pacing tiny chunks at the exact playback
         # rate. Barge-in remains available because the browser tracks and can
         # stop the scheduled AudioBufferSourceNode.
-        await self._emit(
-            "tts.audio",
-            {
-                "pcm16_b64": _b64(pcm),
-                "sample_rate": self.settings.sample_rate,
-            },
-        )
-        self._last_tts_audio_at = time.perf_counter()
+        await self._deliver_audio(pcm)
 
     async def _play_prompt_id(
         self,
@@ -980,14 +1039,7 @@ class CallSession:
                 async def on_audio_chunk(pcm: bytes) -> None:
                     if generation_id != self.generation_id:
                         return
-                    await self._emit(
-                        "tts.audio",
-                        {
-                            "pcm16_b64": _b64(pcm),
-                            "sample_rate": self.settings.sample_rate,
-                        },
-                    )
-                    self._last_tts_audio_at = time.perf_counter()
+                    await self._deliver_audio(pcm)
 
                 async def text_gen():
                     await on_first_token()
@@ -1052,12 +1104,13 @@ class CallSession:
             ):
                 self._greeting_uninterruptible = False
             if emit_turn_done and generation_id == self.generation_id:
-                if not self._awaiting_playback_done:
-                    if self._call_completed or saved:
-                        await self._enter_completed()
-                    else:
-                        self._finish_listening()
-                        await self._emit("state", {"state": self.state.value})
+                if self._awaiting_playback_done:
+                    await self._maybe_auto_complete_playback(generation_id)
+                elif self._call_completed or saved:
+                    await self._enter_completed()
+                else:
+                    self._finish_listening()
+                    await self._emit("state", {"state": self.state.value})
 
     async def _run_reply(self, user_text: str, *, generation_id: int) -> None:
         if self.business_mode == "repair_order":
@@ -1190,14 +1243,7 @@ class CallSession:
             async def on_audio_chunk(pcm: bytes) -> None:
                 if generation_id != self.generation_id:
                     return
-                await self._emit(
-                    "tts.audio",
-                    {
-                        "pcm16_b64": _b64(pcm),
-                        "sample_rate": self.settings.sample_rate,
-                    },
-                )
-                self._last_tts_audio_at = time.perf_counter()
+                await self._deliver_audio(pcm)
 
             async def text_gen():
                 nonlocal full_reply
@@ -1247,17 +1293,27 @@ class CallSession:
             await self._emit("error", {"message": str(exc)})
         finally:
             if generation_id == self.generation_id:
-                if not self._awaiting_playback_done:
+                if self._awaiting_playback_done:
+                    await self._maybe_auto_complete_playback(generation_id)
+                else:
                     self._finish_listening()
                     await self._emit("state", {"state": self.state.value})
 
-    async def on_playback_done(self, generation_id: int) -> None:
+    async def on_playback_done(
+        self,
+        generation_id: int,
+        *,
+        force: bool = False,
+    ) -> None:
         if (
             generation_id != self.generation_id
             or not self._awaiting_playback_done
         ):
             return
-        if self._last_tts_audio_at is not None:
+        if (
+            not force
+            and self._last_tts_audio_at is not None
+        ):
             quiet_ms = (time.perf_counter() - self._last_tts_audio_at) * 1000.0
             if quiet_ms < float(self.settings.playback_done_grace_ms):
                 # Browser may report done too early when streamed chunks arrive
@@ -1384,6 +1440,7 @@ class CallSession:
         self._cancel_asr_watchdog()
         self._turn_clock = None
         self._speaking_started_at = None
+        self._playback_pcm_bytes = 0
 
     async def _enter_completed(self) -> None:
         self._call_completed = True
