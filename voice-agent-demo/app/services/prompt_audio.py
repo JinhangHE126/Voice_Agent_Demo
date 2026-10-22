@@ -21,7 +21,16 @@ class PromptAudioBank:
         self.sample_rate = sample_rate
         self._cache: dict[tuple[str, str], bytes] = {}
         self._ack_idx = 0
-        self._ack_ids = ("ack_checking", "ack_got_it", "ack_ok", "ack_writing")
+        # Short fillers only. Do not prefer ack_checking ("我帮你确认一下") —
+        # it collides with confirm_* TTS ("我确认一下…").
+        self._ack_ids = ("ack_ok", "ack_got_it", "ack_writing")
+        # Still resolvable for legacy audio / explicit play, but not auto-chosen.
+        self._all_ack_ids = (
+            "ack_ok",
+            "ack_got_it",
+            "ack_writing",
+            "ack_checking",
+        )
 
     def resolve(self, prompt_id: str, *, lang: str = "yue") -> Path | None:
         if not prompt_id:
@@ -61,9 +70,6 @@ class PromptAudioBank:
         if not force and len(text) < 12:
             # Short answers ("陈先生"/"啱") usually don't need filler.
             return None
-        # Prefer checking phrasing for long one-shot turns.
-        if len(text) >= 24 and self.resolve("ack_checking", lang=lang):
-            return "ack_checking"
         available = [pid for pid in self._ack_ids if self.resolve(pid, lang=lang)]
         if not available:
             return None
@@ -72,4 +78,4 @@ class PromptAudioBank:
         return prompt_id
 
     def has_any_filler(self, *, lang: str = "yue") -> bool:
-        return any(self.resolve(pid, lang=lang) for pid in self._ack_ids)
+        return any(self.resolve(pid, lang=lang) for pid in self._all_ack_ids)

@@ -26,11 +26,14 @@ def test_prompt_audio_bank_loads_and_chooses_filler(tmp_path: Path) -> None:
     root.mkdir()
     _write_tone_wav(root / "ack_checking.wav")
     _write_tone_wav(root / "ack_ok.wav")
+    _write_tone_wav(root / "ack_got_it.wav")
     bank = PromptAudioBank(root)
     assert bank.has_any_filler() is True
-    assert (
-        bank.choose_filler("屋企冷气唔冻要维修，我叫陈先生电话91234567")
-        == "ack_checking"
-    )
+    # Long turns rotate short fillers; never auto-pick ack_checking.
+    long = "屋企冷气唔冻要维修，我叫陈先生电话91234567"
+    chosen = bank.choose_filler(long)
+    assert chosen in {"ack_ok", "ack_got_it", "ack_writing"}
+    assert chosen != "ack_checking"
+    assert bank.choose_filler(long) != "ack_checking"
     assert bank.load_pcm16("ack_ok") is not None
     assert bank.choose_filler("啱") is None
