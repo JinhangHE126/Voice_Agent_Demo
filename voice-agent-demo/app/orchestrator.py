@@ -410,6 +410,18 @@ class CallSession:
         pcm = self.prompts.load_pcm16(prompt_id, lang=self._prompt_lang())
         if not pcm:
             return False
+        duration_ms = round(
+            len(pcm) / (self.settings.sample_rate * 2) * 1000.0, 1
+        )
+        logger.info(
+            "play_prompt call=%s prompt_id=%s route=status_prompt "
+            "lang=%s bytes=%d duration_ms=%s source=local_wav",
+            self.call_id,
+            prompt_id,
+            self._prompt_lang(),
+            len(pcm),
+            duration_ms,
+        )
         await self._emit(
             "prompt.audio",
             {
@@ -920,6 +932,20 @@ class CallSession:
                 },
             )
 
+        duration_ms = round(
+            len(pcm) / (self.settings.sample_rate * 2) * 1000.0, 1
+        )
+        logger.info(
+            "play_prompt call=%s prompt_id=%s route=%s lang=%s "
+            "bytes=%d duration_ms=%s generation=%s source=local_wav",
+            self.call_id,
+            prompt_id,
+            route,
+            self._prompt_lang(),
+            len(pcm),
+            duration_ms,
+            generation_id,
+        )
         await self._emit(
             "prompt.audio",
             {"prompt_id": prompt_id, "source": "local_wav", "bytes": len(pcm)},
@@ -952,37 +978,31 @@ class CallSession:
         stop: asyncio.Event,
         generation_id: int,
     ) -> None:
-        """Loop a short filler until the real reply's first audio is ready.
+        """Play one short filler while extraction / TTS warm up.
 
-        Extraction and MiniMax TTS both take time; this keeps a short local
-        filler repeating so the caller never hears dead air, then stops the
-        moment the real reply starts producing audio.
+        Only once: repeating “我帮你确认一下” before the real confirm TTS
+        sounded like the same phrase three times. After the single play we
+        wait for stop (real reply ready) without replaying.
         """
         try:
-            pcm = self.prompts.load_pcm16(filler_id, lang=self._prompt_lang())
-            duration_s = (
-                len(pcm) / (self.settings.sample_rate * 2)
-                if pcm
-                else 0.6  # fallback pacing when the local wav is unavailable
+            if generation_id != self.generation_id:
+                return
+            # Always play once when this task runs; never repeat.
+            logger.info(
+                "filler_play call=%s prompt_id=%s play_n=1 generation=%s",
+                self.call_id,
+                filler_id,
+                generation_id,
             )
-            while True:
-                # Play at least once so the filler still fires even when the
-                # reply is ready almost immediately (synchronous paths/tests).
-                await self._play_prompt_id(
-                    filler_id,
-                    generation_id=generation_id,
-                    route="repair_filler",
-                    mark_latency=False,
-                )
-                if stop.is_set() or generation_id != self.generation_id:
-                    return
-                # Pace to the filler's actual playback length, but wake early
-                # when the real reply signals it is ready.
-                try:
-                    await asyncio.wait_for(stop.wait(), timeout=duration_s)
-                    return
-                except asyncio.TimeoutError:
-                    pass
+            await self._play_prompt_id(
+                filler_id,
+                generation_id=generation_id,
+                route="repair_filler",
+                mark_latency=False,
+            )
+            if stop.is_set() or generation_id != self.generation_id:
+                return
+            await stop.wait()
         except asyncio.CancelledError:
             raise
 
@@ -1014,6 +1034,20 @@ class CallSession:
                 )
 
             if not used_local:
+                preview = (
+                    full_reply
+                    if len(full_reply) <= 80
+                    else f"{full_reply[:80]}…"
+                )
+                logger.info(
+                    "play_tts call=%s prompt_id=%s route=%s "
+                    "generation=%s text=%r",
+                    self.call_id,
+                    prompt_id,
+                    route,
+                    generation_id,
+                    preview,
+                )
 
                 async def on_first_token() -> None:
                     if self._turn_clock is not None:
@@ -1118,12 +1152,19 @@ class CallSession:
             filler_stop = asyncio.Event()
             filler_task: asyncio.Task | None = None
             if filler_id:
-                # Start filler immediately while LLM extraction runs and keep
-                # looping until the real reply's first audio is ready.
+                # Start one filler while LLM extraction / TTS warm up.
                 # Do not mark first-audio / awaiting playback for the filler:
                 # it shares generation_id with the real reply, and an early
                 # playback.done would flip LISTENING↔SPEAKING while MiniMax
                 # is still streaming the confirmation sentence.
+                logger.info(
+                    "filler_started call=%s prompt_id=%s user_chars=%d "
+                    "generation=%s",
+                    self.call_id,
+                    filler_id,
+                    len(user_text),
+                    generation_id,
+                )
                 filler_task = asyncio.create_task(
                     self._play_filler_loop(
                         filler_id,

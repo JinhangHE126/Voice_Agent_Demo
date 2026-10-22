@@ -473,6 +473,55 @@ async def test_wait_filler_does_not_mark_playback_awaiting() -> None:
     )
 
     assert ("ack_ok", "repair_filler", False) in played
+    assert sum(1 for p in played if p[1] == "repair_filler") == 1
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_filler_plays_only_once_even_if_reply_is_slow() -> None:
+    stop = asyncio.Event()
+    played: list[str] = []
+
+    events: list[ServerEvent] = []
+
+    async def emit(ev: ServerEvent) -> None:
+        events.append(ev)
+
+    session = CallSession(
+        emit=emit,
+        settings=Settings(
+            agent_mode="mock",
+            business_mode="repair_order",
+            input_denoise_enabled=False,
+            enable_wait_filler=True,
+        ),
+        call_id="filler-once",
+    )
+    session.generation_id = 3
+
+    async def fake_play_prompt_id(
+        prompt_id: str,
+        *,
+        generation_id: int,
+        route: str,
+        mark_latency: bool = True,
+    ) -> bool:
+        played.append(prompt_id)
+        return True
+
+    session._play_prompt_id = fake_play_prompt_id  # type: ignore[method-assign]
+
+    task = asyncio.create_task(
+        session._play_filler_loop("ack_checking", stop, generation_id=3)
+    )
+    await asyncio.sleep(0.05)
+    assert played == ["ack_checking"]
+    # Still waiting for real reply: must not replay.
+    await asyncio.sleep(0.15)
+    assert played == ["ack_checking"]
+    stop.set()
+    await asyncio.wait_for(task, timeout=1.0)
+    assert played == ["ack_checking"]
     await session.close()
 
 

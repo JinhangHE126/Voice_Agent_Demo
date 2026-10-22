@@ -72,6 +72,7 @@ pytest -q
 | 文档 | 内容 |
 |---|---|
 | [AGENTS.md](./AGENTS.md) | 架构、状态机、改代码约定、故障速查 |
+| [SIP_Asterisk_接入方案.md](./SIP_Asterisk_接入方案.md) | Asterisk + AudioSocket SIP 接入（阶段 0–3 已完成） |
 | [voice-agent-demo/README.md](./voice-agent-demo/README.md) | 语音链路细节 |
 | [voice-agent-demo/DEPLOY_EC2.md](./voice-agent-demo/DEPLOY_EC2.md) | EC2 + Cloudflare Tunnel |
 | [repair-order-agent/开发文档.md](./repair-order-agent/开发文档.md) | 产品与业务设计 |
