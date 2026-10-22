@@ -452,7 +452,7 @@ async def test_wait_filler_does_not_mark_playback_awaiting() -> None:
     session.generation_id = 7
     session._turn_clock = 0.0
 
-    played: list[str] = []
+    played: list[tuple] = []
 
     async def fake_play_prompt_id(
         prompt_id: str,
@@ -465,15 +465,88 @@ async def test_wait_filler_does_not_mark_playback_awaiting() -> None:
         return True
 
     session._play_prompt_id = fake_play_prompt_id  # type: ignore[method-assign]
-    session._choose_wait_filler = lambda _text: "ack_ok"  # type: ignore[method-assign]
+
+    # Dynamic confirm → late filler covers MiniMax wait (not early, no LLM).
+    from repair_order.services.dialog_manager import ResponsePlan, TurnResult
+
+    async def fake_process(_call_id, _draft, _text):
+        return TurnResult(
+            plan=ResponsePlan(
+                text="我确认一下维修内容。",
+                prompt_id="confirm_repair",
+                dynamic=True,
+            ),
+            updated_fields=["repair_description"],
+        )
+
+    session.dialog.process_user_text_async = fake_process  # type: ignore[method-assign]
 
     await session._run_reply(
         "我电脑主机坏了，昨天进水了，现在打不开",
         generation_id=7,
     )
 
-    assert ("ack_ok", "repair_filler", False) in played
     assert sum(1 for p in played if p[1] == "repair_filler") == 1
+    assert any(e.type == "filler.started" for e in events)
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_local_wav_reply_does_not_start_filler() -> None:
+    events: list[ServerEvent] = []
+
+    async def emit(ev: ServerEvent) -> None:
+        events.append(ev)
+
+    session = CallSession(
+        emit=emit,
+        settings=Settings(
+            agent_mode="mock",
+            business_mode="repair_order",
+            input_denoise_enabled=False,
+            repair_order_use_llm_extractor=True,
+            enable_wait_filler=True,
+            filler_min_user_chars=1,
+        ),
+        call_id="no-filler-local",
+    )
+    session.state = SessionState.THINKING
+    session.generation_id = 4
+
+    played: list[tuple] = []
+
+    async def fake_play_prompt_id(
+        prompt_id: str,
+        *,
+        generation_id: int,
+        route: str,
+        mark_latency: bool = True,
+    ) -> bool:
+        played.append((prompt_id, route, mark_latency))
+        return True
+
+    session._play_prompt_id = fake_play_prompt_id  # type: ignore[method-assign]
+
+    from repair_order.services.dialog_manager import ResponsePlan, TurnResult
+
+    async def fake_process(_call_id, _draft, _text):
+        return TurnResult(
+            plan=ResponsePlan(
+                text="请问要维修什么？",
+                prompt_id="ask_repair",
+                dynamic=False,
+            ),
+            updated_fields=["customer_name"],
+        )
+
+    session.dialog.process_user_text_async = fake_process  # type: ignore[method-assign]
+
+    # 11 chars: previously forced filler and overlapped ask_repair.
+    await session._run_reply("哎，你叫我何先生就行。", generation_id=4)
+
+    assert not any(p[1] == "repair_filler" for p in played)
+    assert any(p[0] == "ask_repair" for p in played)
+    assert not any(e.type == "filler.started" for e in events)
     await session.close()
 
 

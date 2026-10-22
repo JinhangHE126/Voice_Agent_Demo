@@ -958,18 +958,78 @@ class CallSession:
         )
         return True
 
-    def _choose_wait_filler(self, user_text: str) -> str | None:
+    def _should_start_early_filler(self, user_text: str) -> bool:
+        """Cover LLM extract wait only; short local-wav turns must stay silent."""
+        if not self.settings.enable_wait_filler:
+            return False
+        if not self.settings.repair_order_use_llm_extractor:
+            return False
+        return len((user_text or "").strip()) >= 24
+
+    def _choose_wait_filler(
+        self,
+        user_text: str,
+        *,
+        force: bool | None = None,
+    ) -> str | None:
         if not self.settings.enable_wait_filler:
             return None
-        min_chars = max(0, int(self.settings.filler_min_user_chars))
-        force = len((user_text or "").strip()) >= min_chars
-        # Long turns / LLM extractor path benefit most from filler.
-        if self.settings.repair_order_use_llm_extractor:
-            force = force or len((user_text or "").strip()) >= 8
+        text = (user_text or "").strip()
+        if force is None:
+            # Do not force on short replies (e.g. 11-char name title) — that
+            # used to overlap ack_checking with instant ask_repair wav.
+            min_chars = max(24, int(self.settings.filler_min_user_chars))
+            force = len(text) >= min_chars
         return self.prompts.choose_filler(
             user_text,
             lang=self._prompt_lang(),
             force=force,
+        )
+
+    async def _begin_filler_task(
+        self,
+        user_text: str,
+        *,
+        generation_id: int,
+        filler_stop: asyncio.Event,
+        force: bool = False,
+        reason: str = "",
+    ) -> asyncio.Task | None:
+        filler_id = self._choose_wait_filler(
+            user_text,
+            force=True if force else None,
+        )
+        if not filler_id and force:
+            filler_id = self.prompts.choose_filler(
+                user_text,
+                lang=self._prompt_lang(),
+                force=True,
+            )
+        if not filler_id:
+            return None
+        logger.info(
+            "filler_started call=%s prompt_id=%s user_chars=%d "
+            "generation=%s reason=%s",
+            self.call_id,
+            filler_id,
+            len(user_text or ""),
+            generation_id,
+            reason or "-",
+        )
+        await self._emit(
+            "filler.started",
+            {
+                "prompt_id": filler_id,
+                "user_chars": len(user_text or ""),
+                "reason": reason or "",
+            },
+        )
+        return asyncio.create_task(
+            self._play_filler_loop(
+                filler_id,
+                filler_stop,
+                generation_id,
+            )
         )
 
     async def _play_filler_loop(
@@ -1148,33 +1208,16 @@ class CallSession:
 
     async def _run_reply(self, user_text: str, *, generation_id: int) -> None:
         if self.business_mode == "repair_order":
-            filler_id = self._choose_wait_filler(user_text)
             filler_stop = asyncio.Event()
             filler_task: asyncio.Task | None = None
-            if filler_id:
-                # Start one filler while LLM extraction / TTS warm up.
-                # Do not mark first-audio / awaiting playback for the filler:
-                # it shares generation_id with the real reply, and an early
-                # playback.done would flip LISTENING↔SPEAKING while MiniMax
-                # is still streaming the confirmation sentence.
-                logger.info(
-                    "filler_started call=%s prompt_id=%s user_chars=%d "
-                    "generation=%s",
-                    self.call_id,
-                    filler_id,
-                    len(user_text),
-                    generation_id,
-                )
-                filler_task = asyncio.create_task(
-                    self._play_filler_loop(
-                        filler_id,
-                        filler_stop,
-                        generation_id,
-                    )
-                )
-                await self._emit(
-                    "filler.started",
-                    {"prompt_id": filler_id, "user_chars": len(user_text)},
+            # Early filler only for long turns likely to hit LLM extract.
+            # Local ask_* paths must not start filler up-front (叠播).
+            if self._should_start_early_filler(user_text):
+                filler_task = await self._begin_filler_task(
+                    user_text,
+                    generation_id=generation_id,
+                    filler_stop=filler_stop,
+                    reason="early_llm",
                 )
 
             try:
@@ -1239,6 +1282,16 @@ class CallSession:
                     # Stop accepting mic/ASR as soon as the order is persisted,
                     # while still playing the completion prompt.
                     self._call_completed = True
+                # Late filler: only cover MiniMax dynamic TTS wait. Local wav
+                # replies (ask_*) never start filler here.
+                if turn.plan.dynamic and filler_task is None:
+                    filler_task = await self._begin_filler_task(
+                        user_text,
+                        generation_id=generation_id,
+                        filler_stop=filler_stop,
+                        force=True,
+                        reason="dynamic_tts",
+                    )
                 await self._speak_text(
                     turn.plan.text,
                     generation_id=generation_id,
