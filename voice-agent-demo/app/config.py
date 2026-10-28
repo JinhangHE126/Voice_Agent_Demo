@@ -99,20 +99,29 @@ class Settings(BaseSettings):
     sip_transport: str = "udp"
     # Local SIP bind port (0 = ephemeral).
     sip_port: int = 5060
+    # Advertised Contact/Via host seen by FreeSWITCH (LAN IP of this Agent host).
+    # Empty = let PJSIP rewrite from received/rport (may log IP address change).
+    sip_public_addr: str = ""
     # Comma-separated; S1 prefers G.711 only.
     sip_codecs: str = "PCMU,PCMA"
     # Log verbosity for PJSIP (0–6).
     sip_log_level: int = 3
     # S1: play this local prompt once after Answer (prompt_id under PROMPT_AUDIO_DIR).
     sip_s1_prompt_id: str = "greeting"
-    # After S1 wav ends: hangup | keep (wait for remote BYE).
+    # After S1 wav ends: hangup | keep. Only used when sip_media_mode=wav.
     sip_s1_on_eof: str = "keep"
+    # session = RTP ↔ CallSession (ASR/Dialog/TTS); wav = S1 file player only.
+    sip_media_mode: str = "session"
 
     sample_rate: int = 16000
     frame_ms: int = 20
     input_denoise_enabled: bool = False
     # off | rnnoise
     input_denoise_mode: str = "off"
+    # SIP phone path (G.711 from FreeSWITCH) already has PBX-side AEC/comfort
+    # noise. RNNoise here is CPU-bound and contends with the pjsua2 poll thread
+    # for the GIL, adding 100 ms+ stalls per audio chunk on the asyncio thread.
+    sip_input_denoise_enabled: bool = False
     # Long enough to keep clauses separated by a natural comma pause together.
     vad_silence_ms: int = 650 # 连续静音最小时间， 超过则判定为{无声音}。
     vad_energy_threshold: float = 280.0 # 过滤噪音的一个手段， 调大：更抗噪声， 轻声更难进来。 调小：更灵敏， 底噪容易误触发。

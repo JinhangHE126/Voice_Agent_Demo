@@ -1,20 +1,19 @@
 #!/usr/bin/env python
-"""S1 FreeSWITCH SIP UA (pjsua2): REGISTER + auto-answer + play greeting wav.
+"""FreeSWITCH SIP UA (pjsua2): REGISTER + auto-answer + AI session (S2).
 
 Prerequisites:
   - pjsua2 importable (native PJSIP binding; not in requirements.txt)
-  - PBX extension (default 2000) + SIP_PASSWORD in .env
+  - PBX extension + SIP_PASSWORD in .env
   - Network reachability to SIP_REGISTRAR:5060 and bidirectional RTP
 
 Usage:
 
     cd voice-agent-demo
-    # optional: copy SIP_* from .env.example into .env
     python scripts/run_sip.py --check
     python scripts/run_sip.py
 
-Then from MicroSIP (ext 1000): dial 2000. You should hear greeting.wav.
-S2 will replace wav playback with CallSession (ASR → DialogManager → TTS).
+SIP_MEDIA_MODE=session (default): RTP ↔ CallSession (ASR → Dialog → TTS)
+SIP_MEDIA_MODE=wav: S1 file player only (no listen / no reply)
 """
 
 from __future__ import annotations
@@ -22,6 +21,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -30,27 +30,35 @@ if str(ROOT) not in sys.path:
 
 from app.config import get_settings
 from app.transports.sip_pjsua import SipUaApp, ensure_pjsua2
-from app.transports.sip_session import resolve_s1_prompt_wav
+from app.transports.sip_session import (
+    build_s1_startup_wav_8k,
+    resolve_s1_prompt_wav,
+)
 
 
 def _check(settings) -> int:
-    print("SIP S1 configuration check")
+    mode = (settings.sip_media_mode or "session").strip().lower()
+    print("SIP UA configuration check")
+    print(f"  media mode = {mode}")
     print(f"  user       = {settings.sip_user}")
     print(f"  domain     = {settings.sip_domain}")
     print(f"  registrar  = {settings.sip_registrar}")
     print(f"  transport  = {settings.sip_transport}")
     print(f"  local port = {settings.sip_port}")
+    public = (settings.sip_public_addr or "").strip()
+    print(f"  public addr= {public or '(auto / rport rewrite)'}")
     print(f"  codecs     = {settings.sip_codecs}")
-    print(f"  s1 prompt  = {settings.sip_s1_prompt_id}")
-    print(f"  s1 on eof  = {settings.sip_s1_on_eof}")
+    print(f"  agent mode = {settings.agent_mode}")
     pwd = (settings.sip_password or "").strip()
     print(f"  password   = {'(set)' if pwd else '(EMPTY — REGISTER will fail)'}")
 
     try:
-        wav = resolve_s1_prompt_wav(settings)
-        print(f"  wav        = {wav}  OK")
-    except FileNotFoundError as exc:
-        print(f"  wav        = MISSING: {exc}")
+        src = resolve_s1_prompt_wav(settings)
+        wav = build_s1_startup_wav_8k(settings)
+        print(f"  wav src    = {src} (+ ask_name)")
+        print(f"  wav 8k     = {wav}  OK")
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"  wav        = MISSING/BAD: {exc}")
         return 1
 
     try:
@@ -60,11 +68,16 @@ def _check(settings) -> int:
         print(f"  pjsua2     = MISSING\n{exc}")
         return 2
 
+    if mode == "session":
+        print("  note       = S2 session: will listen + reply via CallSession")
+    else:
+        print("  note       = S1 wav: play only (no ASR / no reply)")
+
     return 0
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Voice Agent SIP UA (S1)")
+    parser = argparse.ArgumentParser(description="Voice Agent SIP UA")
     parser.add_argument(
         "--check",
         action="store_true",
@@ -88,9 +101,7 @@ def main() -> None:
         raise SystemExit(_check(settings))
 
     code = _check(settings)
-    if code == 1:
-        raise SystemExit(code)
-    if code == 2:
+    if code != 0:
         raise SystemExit(code)
 
     app = SipUaApp(settings)
@@ -101,7 +112,7 @@ def main() -> None:
         if ok:
             print(
                 f"REGISTERED status={st.reg_status} {st.reg_status_text!r} "
-                f"— dial {settings.sip_user} from Softphone to test S1 audio"
+                f"— dial {settings.sip_user} from Softphone"
             )
         else:
             print(
@@ -112,7 +123,10 @@ def main() -> None:
     print("SIP UA running — Ctrl+C to stop")
     try:
         while True:
-            app.handle_events(100)
+            # pjsua2's SWIG call may hold the GIL while polling. Long/tight
+            # 100 ms polls starve the asyncio thread that builds CallSession.
+            app.handle_events(10)
+            time.sleep(0.001)
     except KeyboardInterrupt:
         print("stopping…")
     finally:

@@ -9,7 +9,12 @@ import pytest
 
 from app.config import Settings
 from app.transports import sip_pjsua
-from app.transports.sip_session import SipCallBridge, resolve_s1_prompt_wav
+from app.transports.sip_session import (
+    SipCallBridge,
+    build_s1_startup_wav_8k,
+    ensure_s1_playback_wav_8k,
+    resolve_s1_prompt_wav,
+)  # noqa: F401 — SipCallBridge used below
 
 
 def test_resolve_s1_prompt_wav_greeting() -> None:
@@ -23,6 +28,35 @@ def test_resolve_s1_prompt_wav_greeting() -> None:
     assert path.name == "greeting.wav"
 
 
+def test_ensure_s1_playback_wav_8k(tmp_path: Path) -> None:
+    import wave
+
+    root = Path(__file__).resolve().parents[1]
+    src = root / "audio" / "yue" / "greeting.wav"
+    out = ensure_s1_playback_wav_8k(src, cache_dir=tmp_path)
+    assert out.is_file()
+    with wave.open(str(out), "rb") as wf:
+        assert wf.getnchannels() == 1
+        assert wf.getsampwidth() == 2
+        assert wf.getframerate() == 8000
+
+
+def test_build_s1_startup_wav_includes_ask_name(tmp_path: Path) -> None:
+    import wave
+
+    root = Path(__file__).resolve().parents[1]
+    settings = Settings(
+        prompt_audio_dir=root / "audio" / "yue",
+        sip_s1_prompt_id="greeting",
+    )
+    out = build_s1_startup_wav_8k(settings, cache_dir=tmp_path, gap_ms=200)
+    assert out.is_file()
+    with wave.open(str(out), "rb") as wf:
+        assert wf.getframerate() == 8000
+        # greeting(~4.2s) + gap + ask_name(~3.9s) ⇒ clearly longer than greeting alone
+        assert wf.getnframes() / 8000 > 7.5
+
+
 def test_resolve_s1_prompt_wav_missing() -> None:
     settings = Settings(
         prompt_audio_dir=Path("/nonexistent/prompt/root"),
@@ -32,16 +66,9 @@ def test_resolve_s1_prompt_wav_missing() -> None:
         resolve_s1_prompt_wav(settings)
 
 
-def test_sip_call_bridge_s2_stub() -> None:
-    import asyncio
-
-    bridge = SipCallBridge(call_id="test-call")
-
-    async def _run() -> None:
-        with pytest.raises(NotImplementedError, match="S2"):
-            await bridge.run()
-
-    asyncio.run(_run())
+def test_sip_call_bridge_requires_loop() -> None:
+    with pytest.raises(TypeError):
+        SipCallBridge(call_id="test-call")  # type: ignore[call-arg]
 
 
 def test_ensure_pjsua2_message_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -66,6 +93,48 @@ def test_sip_settings_defaults() -> None:
     assert "PCMU" in s.sip_codecs.upper()
     assert s.sip_s1_prompt_id == "greeting"
     assert s.sip_s1_on_eof == "keep"
+    assert s.sip_public_addr == ""
+    assert s.sip_media_mode == "session"
+
+
+def test_sip_call_bridge_tx_chunks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    from app.transports import sip_session as sip_session_mod
+
+    monkeypatch.setattr(sip_session_mod, "SIP_PLAYBACK_CACHE_DIR", tmp_path)
+    loop = asyncio.new_event_loop()
+    bridge = SipCallBridge(call_id="t1", settings=Settings(_env_file=None), loop=loop)
+    # 200 ms @ 16 kHz mono = 6400 bytes
+    pcm16 = b"\x00\x10" * 3200
+    bridge._enqueue_tx_pcm16(pcm16, force=False)
+    assert not bridge._play_q.empty()
+    item = bridge._play_q.get_nowait()
+    assert item.path.is_file()
+    assert item.duration_s == pytest.approx(0.2, abs=0.01)
+    loop.close()
+
+
+def test_sip_bridge_async_close_never_touches_native_media() -> None:
+    import asyncio
+
+    class NativeObject:
+        def __getattr__(self, name):
+            raise AssertionError(f"async close touched native media: {name}")
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        bridge = SipCallBridge(
+            call_id="t-close",
+            settings=Settings(_env_file=None),
+            loop=loop,
+        )
+        bridge._aud = NativeObject()
+        bridge._player = NativeObject()
+        bridge._recorder = NativeObject()
+        await bridge.close()
+
+    asyncio.run(run())
 
 
 def test_sip_start_disables_native_workers_and_polls_on_owner_thread(
@@ -76,6 +145,8 @@ def test_sip_start_disables_native_workers_and_polls_on_owner_thread(
         prompt_audio_dir=root / "audio" / "yue",
         sip_password="test-secret",
         sip_port=0,
+        sip_public_addr="172.17.2.91",
+        sip_media_mode="wav",
     )
     captured: dict[str, object] = {}
 
@@ -91,7 +162,7 @@ def test_sip_start_disables_native_workers_and_polls_on_owner_thread(
             captured["cfg"] = cfg
 
         def transportCreate(self, transport, cfg) -> None:
-            pass
+            captured["transport_cfg"] = cfg
 
         def libStart(self) -> None:
             pass
@@ -131,7 +202,7 @@ def test_sip_start_disables_native_workers_and_polls_on_owner_thread(
     fake_pj = SimpleNamespace(
         Endpoint=FakeEndpoint,
         EpConfig=FakeEpConfig,
-        TransportConfig=lambda: SimpleNamespace(port=None),
+        TransportConfig=lambda: SimpleNamespace(port=None, publicAddress=""),
         AccountConfig=FakeAccountConfig,
         Account=FakeAccount,
         AuthCredInfo=lambda *args: args,
@@ -140,11 +211,13 @@ def test_sip_start_disables_native_workers_and_polls_on_owner_thread(
     monkeypatch.setattr(sip_pjsua, "ensure_pjsua2", lambda: fake_pj)
 
     app = sip_pjsua.SipUaApp(settings)
+    assert "8k" in app.wav_path.name
     app.start()
     cfg = captured["cfg"]
     assert cfg.uaConfig.threadCnt == 0
     assert cfg.uaConfig.mainThreadOnly is True
     assert captured["null_audio"] is True
+    assert captured["transport_cfg"].publicAddress == "172.17.2.91"
     assert app.handle_events(25) == 3
     assert captured["timeout_ms"] == 25
     assert not hasattr(app, "_thread")
