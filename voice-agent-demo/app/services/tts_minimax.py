@@ -219,7 +219,11 @@ class MiniMaxStreamingTTS:
                     raise RuntimeError(f"MiniMax task_failed: {obj}")
                 hex_audio = (obj.get("data") or {}).get("audio") or ""
                 if hex_audio:
-                    pcm = bytes.fromhex(hex_audio)
+                    # hex→bytes is CPU-bound (a 16 s confirm is ~1 MB of hex)
+                    # and used to stall the event loop 100–220 ms per chunk,
+                    # tripping asyncio "slow task" warnings and delaying RX
+                    # audio dispatch. Decode on a worker thread instead.
+                    pcm = await asyncio.to_thread(bytes.fromhex, hex_audio)
                     if first:
                         first = False
                         if on_first_audio:

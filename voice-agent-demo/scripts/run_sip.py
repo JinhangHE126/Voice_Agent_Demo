@@ -12,6 +12,8 @@ Usage:
     python scripts/run_sip.py --check
     python scripts/run_sip.py
 
+Logs (Python + PJSIP) land under ``output/sip/sip-debug-YYYYMMDD-HHMMSS.log``.
+
 SIP_MEDIA_MODE=session (default): RTP ↔ CallSession (ASR → Dialog → TTS)
 SIP_MEDIA_MODE=wav: S1 file player only (no listen / no reply)
 """
@@ -22,6 +24,7 @@ import argparse
 import logging
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -31,9 +34,66 @@ if str(ROOT) not in sys.path:
 from app.config import get_settings
 from app.transports.sip_pjsua import SipUaApp, ensure_pjsua2
 from app.transports.sip_session import (
+    SIP_PLAYBACK_CACHE_DIR,
     build_s1_startup_wav_8k,
     resolve_s1_prompt_wav,
 )
+
+
+class _TeeStream:
+    """Mirror writes to both the console and a log file (for PJSIP C logs)."""
+
+    def __init__(self, primary, secondary) -> None:
+        self._primary = primary
+        self._secondary = secondary
+
+    def write(self, data: str) -> int:
+        n = self._primary.write(data)
+        try:
+            self._secondary.write(data)
+            self._secondary.flush()
+        except Exception:
+            pass
+        return n
+
+    def flush(self) -> None:
+        self._primary.flush()
+        try:
+            self._secondary.flush()
+        except Exception:
+            pass
+
+    def isatty(self) -> bool:
+        return bool(getattr(self._primary, "isatty", lambda: False)())
+
+    def fileno(self) -> int:
+        return self._primary.fileno()
+
+
+def _setup_logging() -> Path:
+    """Console + file for Python logging; tee stdout/stderr for PJSIP C logs."""
+    log_dir = SIP_PLAYBACK_CACHE_DIR
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"sip-debug-{datetime.now():%Y%m%d-%H%M%S}.log"
+    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter(fmt))
+    # Bind to the real console streams so Python logs are not double-written
+    # after we tee sys.stdout/sys.stderr for PJSIP C-level output.
+    stream_handler = logging.StreamHandler(sys.__stderr__)
+    stream_handler.setFormatter(logging.Formatter(fmt))
+    logging.basicConfig(
+        level=logging.INFO,
+        format=fmt,
+        handlers=[stream_handler, file_handler],
+        force=True,
+    )
+    # PJSIP writes to stdout/stderr outside Python logging; mirror them too.
+    log_fp = open(log_path, "a", encoding="utf-8", buffering=1)  # noqa: SIM115
+    sys.stdout = _TeeStream(sys.__stdout__, log_fp)
+    sys.stderr = _TeeStream(sys.__stderr__, log_fp)
+    logging.getLogger(__name__).info("SIP debug log → %s", log_path.resolve())
+    return log_path
 
 
 def _check(settings) -> int:
@@ -91,15 +151,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
     settings = get_settings()
 
     if args.check:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
         raise SystemExit(_check(settings))
 
+    log_path = _setup_logging()
     code = _check(settings)
     if code != 0:
         raise SystemExit(code)
@@ -120,7 +181,7 @@ def main() -> None:
                 f"(status={st.reg_status} {st.reg_status_text!r}). "
                 "Process keeps running; check password / firewall / domain."
             )
-    print("SIP UA running — Ctrl+C to stop")
+    print(f"SIP UA running — Ctrl+C to stop (log={log_path})")
     try:
         while True:
             # pjsua2's SWIG call may hold the GIL while polling. Long/tight
@@ -131,6 +192,8 @@ def main() -> None:
         print("stopping…")
     finally:
         app.stop()
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
 
 
 if __name__ == "__main__":

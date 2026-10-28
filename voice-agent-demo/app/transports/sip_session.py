@@ -312,36 +312,48 @@ class SipCallBridge:
         if pcm:
             asyncio.run_coroutine_threadsafe(self._session.on_pcm16(pcm), self.loop)
 
-    def _enqueue_tx_pcm16(self, pcm16: bytes, *, force: bool = False) -> None:
-        if self._closed:
-            return
+    def _pop_tx_chunk(
+        self, pcm16: bytes, *, force: bool
+    ) -> tuple[bytes, Path] | None:
+        """Under lock: buffer pcm16 and pop a whole play chunk when due.
+
+        Returns ``(pcm, path)`` to write, or ``None`` if nothing should be
+        enqueued yet. The heavy wav write stays OUT of the lock and off the
+        caller's thread.
+        """
         with self._tx_lock:
             if pcm16:
                 self._tx_buf.extend(pcm16)
-            # A whole local wav (fixed prompt / filler) arrives as one large
-            # chunk: write everything buffered as a single item immediately.
-            # Streaming TTS chunks are smaller and stay buffered until the
-            # turn flushes (force=True), so each dynamic utterance becomes one
-            # continuous wav with no inter-chunk gaps.
             single_shot = (not force) and len(pcm16) >= SINGLE_CHUNK_BYTES_16K
-            if single_shot or force:
-                if self._tx_buf:
-                    chunk = bytes(self._tx_buf)
-                    self._tx_buf.clear()
-                    self._tx_seq += 1
-                    path = (
-                        SIP_PLAYBACK_CACHE_DIR
-                        / f"tx_{self.call_id}_{self._tx_seq}.wav"
-                    ).resolve()
-                    dur = write_pcm16_wav(path, chunk, sample_rate=RATE_16K)
-                    try:
-                        self._play_q.put_nowait(
-                            _PlayItem(path=path, duration_s=dur)
-                        )
-                    except queue.Full:
-                        logger.warning(
-                            "SIP TX play queue full call=%s", self.call_id
-                        )
+            if not (single_shot or force):
+                return None
+            if not self._tx_buf:
+                return None
+            chunk = bytes(self._tx_buf)
+            self._tx_buf.clear()
+            self._tx_seq += 1
+            path = (
+                SIP_PLAYBACK_CACHE_DIR / f"tx_{self.call_id}_{self._tx_seq}.wav"
+            ).resolve()
+            return chunk, path
+
+    async def _enqueue_tx_pcm16(self, pcm16: bytes, *, force: bool = False) -> None:
+        if self._closed:
+            return
+        item = self._pop_tx_chunk(pcm16, force=force)
+        if item is None:
+            return
+        chunk, path = item
+        # Write the wav off the asyncio thread: a 12 s confirm is ~400 KB and
+        # the synchronous disk write used to stall the loop 100–160 ms,
+        # tripping the "slow task" warning and slowing TTS synthesis.
+        dur = await asyncio.to_thread(
+            write_pcm16_wav, path, chunk, sample_rate=RATE_16K
+        )
+        try:
+            self._play_q.put_nowait(_PlayItem(path=path, duration_s=dur))
+        except queue.Full:
+            logger.warning("SIP TX play queue full call=%s", self.call_id)
 
     def _create_tx_player(self, item: _PlayItem) -> Any | None:
         """Build a file player for one TX chunk (no transmit yet)."""
@@ -529,14 +541,14 @@ class SipCallBridge:
                     self.request_hangup()
 
         async def on_audio_out(pcm16k: bytes) -> None:
-            self._enqueue_tx_pcm16(pcm16k, force=False)
+            await self._enqueue_tx_pcm16(pcm16k, force=False)
 
         async def on_audio_flush() -> None:
             # Flush whatever remains as a single play item, then wait for the
             # owner thread to actually play it out. This keeps CallSession's
             # own playback-done timing accurate now that dynamic TTS is
             # buffered whole (no per-chunk advance while synthesizing).
-            self._enqueue_tx_pcm16(b"", force=True)
+            await self._enqueue_tx_pcm16(b"", force=True)
             await self._wait_tx_playback_done()
 
         session_settings = self.settings

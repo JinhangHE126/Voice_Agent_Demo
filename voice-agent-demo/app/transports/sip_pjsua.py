@@ -550,11 +550,13 @@ class SipUaApp:
             raise RuntimeError(
                 "SipUaApp.handle_events() must run on the thread that called start()"
             )
+        t0 = time.perf_counter()
         try:
             n = int(ep.libHandleEvents(max(0, int(timeout_ms))))
         except Exception:
             logger.exception("libHandleEvents failed")
             n = 0
+        lib_ms = (time.perf_counter() - t0) * 1000.0
         self._process_pending_media()
         with self._lock:
             bridges = list(self._bridges.values())
@@ -564,6 +566,18 @@ class SipUaApp:
             except Exception:
                 logger.exception("SIP bridge pump failed")
         self._process_pending_hangups()
+        # Media profiling: PJSIP's conference clock (null device) is driven by
+        # libHandleEvents. A single slow poll starves the RX jitter buffer and
+        # shows up as "Jitter buffer empty / plc invoked". Log any poll that
+        # blows the frame budget so we can correlate it to RX frame loss.
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        if lib_ms > 30.0 or total_ms > 40.0:
+            logger.warning(
+                "SIP poll slow lib_ms=%.1f total_ms=%.1f n=%s",
+                lib_ms,
+                total_ms,
+                n,
+            )
         return n
 
     def status(self) -> SipUaStatus:
