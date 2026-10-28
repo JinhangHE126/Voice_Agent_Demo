@@ -22,6 +22,7 @@ from app.transports.resample import (
     resample_down,
     resample_up,
 )
+from app.transports.sip_session import SipCallBridge, resolve_s1_prompt_wav
 
 __all__ = [
     "AUDIOSOCKET_FRAME_BYTES_8K",
@@ -31,6 +32,7 @@ __all__ = [
     "AudioTransport",
     "Frame",
     "RateConverter",
+    "SipCallBridge",
     "echo_handler",
     "encode_audio_slin8",
     "encode_hangup",
@@ -40,4 +42,5 @@ __all__ = [
     "make_upsampler",
     "resample_down",
     "resample_up",
+    "resolve_s1_prompt_wav",
 ]

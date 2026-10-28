@@ -58,6 +58,21 @@ AGENT_MODE=cloud
 
 大陆 MiniMax 可把 `MINIMAX_WS_URL` 改成 `wss://api.minimaxi.com/ws/v1/t2a_v2`。
 
+## SIP UA（FreeSWITCH / S1 骨架）
+
+产品方向：Agent 作为 SIP 分机（默认 `2000`）向 FusionPBX/FreeSWITCH 注册，被叫自动接听。
+
+```bash
+# 1) 安装 pjsua2（原生绑定，不在 requirements.txt）
+# 2) .env 填写 SIP_USER / SIP_PASSWORD / SIP_DOMAIN / SIP_REGISTRAR
+python scripts/run_sip.py --check
+python scripts/run_sip.py
+```
+
+S1：REGISTER → Answer → 播放本地 `greeting.wav`（可改 `SIP_S1_PROMPT_ID`）。  
+S2：再接到现有 `CallSession`（ASR → DialogManager → TTS）。  
+备选电话路径仍是 Asterisk AudioSocket：`python scripts/run_audiosocket.py`。
+
 ## 测试
 
 ```bash

@@ -337,12 +337,16 @@ Voice_Agent_Demo/
 | 路径                             | 作用                                |
 | ------------------------------ | --------------------------------- |
 | `scripts/run_web.py`           | 启动 FastAPI/Uvicorn                |
+| `scripts/run_sip.py`           | FreeSWITCH SIP UA（pjsua2；S1：REGISTER+Answer+播 wav） |
+| `scripts/run_audiosocket.py`   | Asterisk AudioSocket 桥（备选电话壳）     |
 | `app/web.py`                   | HTTP + WebSocket 入口               |
 | `app/orchestrator.py`          | 会话编排：VAD、ASR、打断、filler、TTS        |
 | `app/vad.py`                   | WebRTC + 能量门限 + 强制结束/滑动窗口         |
 | `app/services/asr_qwen.py`     | Qwen 实时 ASR（含 final 超时兜底）         |
 | `app/services/tts_minimax.py`  | MiniMax 流式 TTS                    |
 | `app/services/prompt_audio.py` | 本地 `audio/<lang>/<prompt>.wav` 路由 |
+| `app/transports/sip_pjsua.py`  | SIP UA（pjsua2）；正式电话路径             |
+| `app/transports/sip_session.py`| SIP↔CallSession 胶水（S2 占位）         |
 | `app/config.py`                | 环境变量 / Settings                   |
 | `static/index.html`            | 前端听筒页 + 订单草稿展示                    |
 | `audio/yue/`                   | 粤语预制录音（mono 16k PCM wav）          |

@@ -89,6 +89,25 @@ class Settings(BaseSettings):
     audiosocket_port: int = 9092
     # Pace outbound 8 kHz frames at realtime (20 ms). Tests may disable.
     audiosocket_pace_audio: bool = True
+
+    # ---- FreeSWITCH SIP UA (pjsua2) — S1 REGISTER + Answer + play wav ----
+    # Extension model: register as SIP_USER @ SIP_DOMAIN toward SIP_REGISTRAR.
+    sip_user: str = "2000"
+    sip_password: str = ""
+    sip_domain: str = "172.17.7.53"
+    sip_registrar: str = "172.17.7.53"
+    sip_transport: str = "udp"
+    # Local SIP bind port (0 = ephemeral).
+    sip_port: int = 5060
+    # Comma-separated; S1 prefers G.711 only.
+    sip_codecs: str = "PCMU,PCMA"
+    # Log verbosity for PJSIP (0–6).
+    sip_log_level: int = 3
+    # S1: play this local prompt once after Answer (prompt_id under PROMPT_AUDIO_DIR).
+    sip_s1_prompt_id: str = "greeting"
+    # After S1 wav ends: hangup | keep (wait for remote BYE).
+    sip_s1_on_eof: str = "keep"
+
     sample_rate: int = 16000
     frame_ms: int = 20
     input_denoise_enabled: bool = False

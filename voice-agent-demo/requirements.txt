@@ -11,3 +11,5 @@ pyrnnoise==0.4.5
 webrtcvad-wheels>=2.0.14
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
+# SIP UA (S1+): install pjsua2 / PJSIP Python bindings separately — not on PyPI.
+# See scripts/run_sip.py and: python -c "import pjsua2"
