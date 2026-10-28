@@ -477,8 +477,10 @@ class SipUaApp:
 
         if isinstance(player_or_holder, dict):
             player = player_or_holder.get("player")
+            next_player = player_or_holder.get("next_player")
         else:
             player = player_or_holder
+            next_player = None
 
         # Sever asyncio-side references first; all native destruction below is
         # deliberately performed on this PJSIP owner thread.
@@ -495,6 +497,9 @@ class SipUaApp:
             # destroy() explicitly and then letting SWIG destruct it produced
             # duplicate conference-port removal.
             player = None
+
+        if next_player is not None:
+            next_player = None
 
         if recorder is not None:
             recorder = None

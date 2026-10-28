@@ -37,8 +37,14 @@ logger = logging.getLogger(__name__)
 
 SIP_PLAYBACK_CACHE_DIR = ROOT_DIR / "output" / "sip"
 WAV_HEADER = 44
-# Play TX in ~200 ms chunks for lower first-byte latency than whole-utterance.
-TX_CHUNK_BYTES_16K = RATE_16K * 2 * 200 // 1000  # 6400 bytes
+# A single on_audio_out chunk at least this large is a whole local wav
+# (fixed prompt or filler) and is written as ONE play item, so the caller
+# hears it continuously with no internal conference create/destroy gaps.
+SINGLE_CHUNK_BYTES_16K = RATE_16K * 2 * 500 // 1000  # 16000 bytes (500 ms)
+# Streaming (MiniMax TTS) chunks are smaller than the threshold above and are
+# NOT sliced into intermediate play items. They accumulate in ``_tx_buf`` and
+# are written as a SINGLE gapless wav when the turn flushes, eliminating the
+# per-chunk conference-port churn that made long dynamic confirmations choppy.
 
 HangupFn = Callable[[], None]
 
@@ -196,6 +202,16 @@ class SipCallBridge:
         self._play_q: queue.Queue[_PlayItem] = queue.Queue()
         self._player: Any | None = None
         self._play_until = 0.0
+        # Pre-created (but not yet transmitting) next chunk. Kept ready so the
+        # hand-over between consecutive TX chunks avoids the ~15 ms
+        # create-player + conference-add latency that made long TTS turns
+        # sound choppy.
+        self._next_player: Any | None = None
+        self._next_duration = 0.0
+        self._next_name = ""
+        # Set while on_audio_flush() awaits actual playback drain; the owner
+        # thread sets it when the TX queue, buffer and player are all idle.
+        self._tx_idle_event: asyncio.Event | None = None
         self._aud: Any | None = None
         self._pj: Any | None = None
         self._recorder: Any | None = None
@@ -245,6 +261,15 @@ class SipCallBridge:
         self._aud = None
         self._recorder = None
         self._player = None
+        self._next_player = None
+        self._next_duration = 0.0
+        self._next_name = ""
+        ev = self._tx_idle_event
+        self._tx_idle_event = None
+        if ev is not None:
+            # Unblock any asyncio-side flush waiter so it cannot hang after
+            # the call is torn down.
+            self.loop.call_soon_threadsafe(ev.set)
         holder = getattr(self, "_player_holder", None)
         if holder is not None:
             holder.clear()
@@ -293,23 +318,57 @@ class SipCallBridge:
         with self._tx_lock:
             if pcm16:
                 self._tx_buf.extend(pcm16)
-            while self._tx_buf and (
-                force or len(self._tx_buf) >= TX_CHUNK_BYTES_16K
-            ):
-                take = len(self._tx_buf) if force else TX_CHUNK_BYTES_16K
-                chunk = bytes(self._tx_buf[:take])
-                del self._tx_buf[:take]
-                self._tx_seq += 1
-                path = (
-                    SIP_PLAYBACK_CACHE_DIR / f"tx_{self.call_id}_{self._tx_seq}.wav"
-                ).resolve()
-                dur = write_pcm16_wav(path, chunk, sample_rate=RATE_16K)
-                try:
-                    self._play_q.put_nowait(_PlayItem(path=path, duration_s=dur))
-                except queue.Full:
-                    logger.warning("SIP TX play queue full call=%s", self.call_id)
-                if force:
-                    break
+            # A whole local wav (fixed prompt / filler) arrives as one large
+            # chunk: write everything buffered as a single item immediately.
+            # Streaming TTS chunks are smaller and stay buffered until the
+            # turn flushes (force=True), so each dynamic utterance becomes one
+            # continuous wav with no inter-chunk gaps.
+            single_shot = (not force) and len(pcm16) >= SINGLE_CHUNK_BYTES_16K
+            if single_shot or force:
+                if self._tx_buf:
+                    chunk = bytes(self._tx_buf)
+                    self._tx_buf.clear()
+                    self._tx_seq += 1
+                    path = (
+                        SIP_PLAYBACK_CACHE_DIR
+                        / f"tx_{self.call_id}_{self._tx_seq}.wav"
+                    ).resolve()
+                    dur = write_pcm16_wav(path, chunk, sample_rate=RATE_16K)
+                    try:
+                        self._play_q.put_nowait(
+                            _PlayItem(path=path, duration_s=dur)
+                        )
+                    except queue.Full:
+                        logger.warning(
+                            "SIP TX play queue full call=%s", self.call_id
+                        )
+
+    def _create_tx_player(self, item: _PlayItem) -> Any | None:
+        """Build a file player for one TX chunk (no transmit yet)."""
+        pj = self._pj
+        if pj is None:
+            return None
+        player = pj.AudioMediaPlayer()
+        no_loop = getattr(pj, "PJMEDIA_FILE_NO_LOOP", 1)
+        player.createPlayer(str(item.path), no_loop)
+        return player
+
+    def _start_tx_player(
+        self, player: Any, *, duration_s: float, name: str
+    ) -> None:
+        """Start transmitting a (possibly pre-created) player."""
+        aud = self._aud
+        assert aud is not None
+        player.startTransmit(aud)
+        self._player = player
+        self._player_holder["player"] = player
+        # Pad so the conference clock drains the final samples before we tear
+        # the player down. The pre-created next player makes the switch cheap,
+        # so this pad is the only remaining source of inter-chunk silence.
+        self._play_until = time.monotonic() + duration_s + 0.03
+        logger.info(
+            "SIP TX play %s dur=%.2fs call=%s", name, duration_s, self.call_id
+        )
 
     def _pump_tx_player(self) -> None:
         pj = self._pj
@@ -317,8 +376,9 @@ class SipCallBridge:
         if pj is None or aud is None:
             return
         now = time.monotonic()
-        if self._player is not None and now < self._play_until:
-            return
+
+        # Current chunk finished: drop it and immediately promote the
+        # pre-created next chunk so consecutive chunks play back-to-back.
         if self._player is not None and now >= self._play_until:
             try:
                 self._player.stopTransmit(aud)
@@ -329,28 +389,121 @@ class SipCallBridge:
             # here double-removes the conference port (PJ_EINVAL noise).
             self._player = None
             self._player_holder.pop("player", None)
+            if self._next_player is not None:
+                nxt = self._next_player
+                nxt_duration = self._next_duration
+                nxt_name = self._next_name
+                self._next_player = None
+                self._next_duration = 0.0
+                self._next_name = ""
+                self._player_holder.pop("next_player", None)
+                try:
+                    self._start_tx_player(
+                        nxt, duration_s=nxt_duration, name=nxt_name
+                    )
+                except Exception:
+                    logger.exception(
+                        "SIP TX promote failed call=%s", self.call_id
+                    )
 
-        try:
-            item = self._play_q.get_nowait()
-        except queue.Empty:
+        # No player playing: start one from the queue.
+        if self._player is None:
+            try:
+                item = self._play_q.get_nowait()
+            except queue.Empty:
+                item = None
+            if item is not None:
+                try:
+                    player = self._create_tx_player(item)
+                    if player is not None:
+                        self._start_tx_player(
+                            player,
+                            duration_s=item.duration_s,
+                            name=item.path.name,
+                        )
+                except Exception:
+                    logger.exception("SIP TX play failed call=%s", self.call_id)
+
+        # Pre-create the following chunk while the current one plays, so its
+        # conference port is already added at switch time.
+        if self._next_player is None:
+            try:
+                item = self._play_q.get_nowait()
+            except queue.Empty:
+                item = None
+            if item is not None:
+                try:
+                    self._next_player = self._create_tx_player(item)
+                    if self._next_player is not None:
+                        self._next_duration = item.duration_s
+                        self._next_name = item.path.name
+                        self._player_holder["next_player"] = self._next_player
+                except Exception:
+                    logger.exception(
+                        "SIP TX pre-create failed call=%s", self.call_id
+                    )
+
+        self._maybe_signal_tx_idle(now)
+
+    def _maybe_signal_tx_idle(self, now: float) -> None:
+        """Signal the asyncio flush waiter once all TX audio has drained."""
+        with self._tx_lock:
+            ev = self._tx_idle_event
+            if ev is None:
+                return
+            has_buffered = bool(self._tx_buf)
+        if has_buffered or not self._play_q.empty():
             return
+        if self._player is not None and now < self._play_until:
+            return
+        if self._next_player is not None:
+            return
+        with self._tx_lock:
+            if self._tx_idle_event is ev:
+                self._tx_idle_event = None
+        self.loop.call_soon_threadsafe(ev.set)
+
+    def _estimate_pending_playout_s(self) -> float:
+        """Best-effort upper bound of still-unplayed TX audio (seconds)."""
+        total = 0.0
+        with self._tx_lock:
+            total += len(self._tx_buf) / (2 * RATE_16K)
         try:
-            player = pj.AudioMediaPlayer()
-            no_loop = getattr(pj, "PJMEDIA_FILE_NO_LOOP", 1)
-            player.createPlayer(str(item.path), no_loop)
-            player.startTransmit(aud)
-            self._player = player
-            self._player_holder["player"] = player
-            # Small pad so we don't cut the tail.
-            self._play_until = time.monotonic() + item.duration_s + 0.05
-            logger.info(
-                "SIP TX play %s dur=%.2fs call=%s",
-                item.path.name,
-                item.duration_s,
-                self.call_id,
-            )
+            for it in list(self._play_q.queue):
+                total += it.duration_s
         except Exception:
-            logger.exception("SIP TX play failed call=%s", self.call_id)
+            pass
+        if self._player is not None:
+            total += max(0.0, self._play_until - time.monotonic())
+        return total
+
+    async def _wait_tx_playback_done(self) -> None:
+        """Await drain of the TX queue/buffer/player on the owner thread.
+
+        Dynamic TTS is buffered whole and only queued at flush, so playback
+        starts after this coroutine is reached. We wait (with a generous,
+        audio-proportional timeout) rather than returning immediately so the
+        caller does not reopen LISTENING while the confirm is still playing.
+        """
+        if self._closed or self._pj is None:
+            return
+        est = self._estimate_pending_playout_s()
+        timeout = max(3.0, est * 1.5 + 1.0)
+        ev = asyncio.Event()
+        with self._tx_lock:
+            self._tx_idle_event = ev
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "SIP TX playback-done wait timed out call=%s est=%.2fs",
+                self.call_id,
+                est,
+            )
+        finally:
+            with self._tx_lock:
+                if self._tx_idle_event is ev:
+                    self._tx_idle_event = None
 
     async def start(self) -> None:
         if self._session is not None:
@@ -379,8 +532,12 @@ class SipCallBridge:
             self._enqueue_tx_pcm16(pcm16k, force=False)
 
         async def on_audio_flush() -> None:
-            # Flush whatever remains as a final play chunk.
-            self._enqueue_tx_pcm16(b"\x00\x00", force=True)
+            # Flush whatever remains as a single play item, then wait for the
+            # owner thread to actually play it out. This keeps CallSession's
+            # own playback-done timing accurate now that dynamic TTS is
+            # buffered whole (no per-chunk advance while synthesizing).
+            self._enqueue_tx_pcm16(b"", force=True)
+            await self._wait_tx_playback_done()
 
         session_settings = self.settings
         if (

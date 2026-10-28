@@ -105,13 +105,38 @@ def test_sip_call_bridge_tx_chunks(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(sip_session_mod, "SIP_PLAYBACK_CACHE_DIR", tmp_path)
     loop = asyncio.new_event_loop()
     bridge = SipCallBridge(call_id="t1", settings=Settings(_env_file=None), loop=loop)
-    # 200 ms @ 16 kHz mono = 6400 bytes
-    pcm16 = b"\x00\x10" * 3200
-    bridge._enqueue_tx_pcm16(pcm16, force=False)
-    assert not bridge._play_q.empty()
-    item = bridge._play_q.get_nowait()
-    assert item.path.is_file()
-    assert item.duration_s == pytest.approx(0.2, abs=0.01)
+
+    def drain_duration() -> float:
+        total = 0.0
+        while not bridge._play_q.empty():
+            item = bridge._play_q.get_nowait()
+            assert item.path.is_file()
+            total += item.duration_s
+        return total
+
+    # A small streaming chunk below the single-chunk threshold only buffers.
+    bridge._tx_buf.clear()
+    bridge._enqueue_tx_pcm16(b"\x00\x10" * 3200, force=False)  # 200 ms
+    assert bridge._play_q.empty()
+
+    # force flushes the buffered partial as one item.
+    bridge._enqueue_tx_pcm16(b"", force=True)
+    assert drain_duration() == pytest.approx(0.2, abs=0.01)
+
+    # A whole local wav (>= 500 ms) is written as ONE item immediately.
+    bridge._tx_buf.clear()
+    bridge._enqueue_tx_pcm16(b"\x00\x10" * 9600, force=False)  # 600 ms
+    assert drain_duration() == pytest.approx(0.6, abs=0.02)
+
+    # Small streaming chunks accumulate WHOLE and flush as ONE item, so a
+    # long dynamic TTS confirmation has no inter-chunk conference gaps.
+    bridge._tx_buf.clear()
+    for _ in range(4):
+        bridge._enqueue_tx_pcm16(b"\x00\x10" * 4800, force=False)  # 300 ms each
+    # Nothing is enqueued until the turn flushes.
+    assert bridge._play_q.empty()
+    bridge._enqueue_tx_pcm16(b"", force=True)
+    assert drain_duration() == pytest.approx(1.2, abs=0.02)
     loop.close()
 
 
